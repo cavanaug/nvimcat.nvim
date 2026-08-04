@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # nvimcat — dump a file as ANSI using your full Neovim config (plugins, themes, …).
-# Uses a PTY + nvim__screenshot so output matches the real TUI cell grid.
+# Uses nvim --embed + UI attach so output matches the real TUI cell grid.
 set -euo pipefail
 
 # Resolve symlinks so ~/.local/bin/nvimcat → plugin tree, not ~/.local.
@@ -52,7 +52,4 @@ for f in "$@"; do
   fi
 done
 
-SHOT="$(mktemp -t nvimcat.XXXXXX.shot)"
-trap 'rm -f "$SHOT"' EXIT
-
-exec python3 "$ROOT/bin/nvimcat-pty" "$NVIMCAT_WIDTH" "$SHOT" "${files[@]}"
+exec python3 "$ROOT/bin/nvimcat-embed" "$NVIMCAT_WIDTH" "${files[@]}"

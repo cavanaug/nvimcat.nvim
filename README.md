@@ -65,11 +65,11 @@ Inside Neovim:
 
 ## How it works
 
-1. `nvimcat` starts `nvim --headless` with your normal config (`g:nvimcat = 1`).
+1. `nvimcat` starts `nvim --embed` with your normal config (`g:nvimcat = 1`) and attaches a UI client.
 2. Waits until Lazy is ready (`VeryLazy` / short poll — not a fixed multi-second sleep).
 3. Disables side-effect plugins (Copilot, etc.), opens the file via env (not argv).
-4. Sizes the window, waits for decorations (tables / mermaid virt_lines) to settle.
-5. Captures the screen grid → ANSI on stdout, then quits.
+4. Sizes the window, waits until decorations are ready (tables / mermaid virt_lines).
+5. Emits the composed screen grid as ANSI on stdout, then quits.
 
 ## Config
 
