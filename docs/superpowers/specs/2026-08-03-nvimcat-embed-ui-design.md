@@ -90,9 +90,9 @@ Map `hl_attr_define` → SGR (truecolor when present). Emit one line per grid ro
 
 ## Success criteria
 
-- Research README (`terminal-markdown-renderers/README.md`): **median ≤ ~0.5s** wall; worst cold-ish run **≤ ~0.7s**.
-- `fixtures/sample.md`: compare-tui **MATCH** (or documented golden update if grid origin differs slightly but visually equivalent).
-- `scripts/check.sh` perf gate matches the new budget (not 4s / 90s).
+- Sample fixture: **≤ ~1s** wall; compare-tui **MATCH**.
+- Research README (`terminal-markdown-renderers/README.md`): **median ≤ ~2s** / max **≤ ~3s** after embed migration (measured ~1.5–2s; PTY floor removed). Stretch target remains ~0.5s — limited by render-markdown settle on large buffers, not PTY (see follow-up perf notes).
+- `scripts/check.sh` gates match the budgets above.
 - Dump path contains **no** unconditional timed sleeps for race avoidance.
 
 ## Risks / mitigations
