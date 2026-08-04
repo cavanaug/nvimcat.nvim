@@ -3,8 +3,6 @@ local M = {}
 
 ---@class nvimcat.Opts
 ---@field width? integer
----@field min_wait_ms? integer
----@field settle_ms? integer
 ---@field timeout_ms? integer
 ---@field max_lines? integer
 ---@field install_cli? boolean
@@ -12,8 +10,6 @@ local M = {}
 
 local DEFAULTS = {
   -- width: nil → NVIMCAT_WIDTH / COLUMNS / vim.o.columns (see prepare_chrome)
-  min_wait_ms = 80,
-  settle_ms = 120,
   timeout_ms = 8000,
   max_lines = 5000,
   install_cli = true,
@@ -143,19 +139,6 @@ local function ensure_mermaid_setup()
   return mod
 end
 
-local function screen_fingerprint()
-  local parts = {}
-  local rows = math.min(vim.o.lines or 24, 220)
-  local cols = math.min(vim.o.columns or 80, 120)
-  for r = 1, rows do
-    for c = 1, cols do
-      parts[#parts + 1] = vim.fn.screenstring(r, c)
-    end
-    parts[#parts + 1] = "\n"
-  end
-  return table.concat(parts)
-end
-
 local function try_force_render(buf, win)
   if not plugins_loaded then
     ensure_lazy_markdown_plugins()
@@ -258,84 +241,26 @@ local function is_ready(buf, need_mermaid)
 end
 
 local function settle(buf, win, opts, need_mermaid)
-  local t0 = vim.uv.now()
-  local force_calls = 0
-
-  while vim.uv.now() - t0 < opts.timeout_ms do
-    if not is_ready(buf, need_mermaid) then
-      force_calls = force_calls + 1
-      try_force_render(buf, win)
-      -- Must pump luv/vim.system callbacks (bare vim.wait(ms) is not enough).
-      vim.wait(40, function()
-        return is_ready(buf, need_mermaid)
-      end, 10)
-    else
-      -- ponytail: once ready, one settle sleep — no decor-fingerprint thrash on large buffers.
-      local elapsed = vim.uv.now() - t0
-      local remain = math.max(opts.min_wait_ms, opts.settle_ms) - elapsed
-      if remain > 0 then
-        vim.wait(remain, function()
-          return false
-        end)
-      end
-      _timing(string.format("settle_ok elapsed=%d force=%d", vim.uv.now() - t0, force_calls))
+  if not is_ready(buf, need_mermaid) then
+    try_force_render(buf, win)
+  end
+  local ok = vim.wait(opts.timeout_ms, function()
+    if is_ready(buf, need_mermaid) then
       return true
     end
+    try_force_render(buf, win)
+    return false
+  end, 10)
+  if not ok then
+    io.stderr:write(
+      "nvimcat: settle timeout (ready="
+        .. tostring(is_ready(buf, need_mermaid))
+        .. " mermaid="
+        .. tostring(need_mermaid)
+        .. ")\n"
+    )
   end
-  _timing(string.format("settle_timeout elapsed=%d force=%d", vim.uv.now() - t0, force_calls))
-  io.stderr:write(
-    "nvimcat: settle timeout (ready="
-      .. tostring(is_ready(buf, need_mermaid))
-      .. " mermaid="
-      .. tostring(need_mermaid)
-      .. ")\n"
-  )
   return is_ready(buf, need_mermaid)
-end
-
---- Capture the live TUI grid via nvim__screenshot (composed cell attrs).
----@return string ansi
-local function capture_screenshot()
-  local path = vim.env.NVIMCAT_SHOT
-  local owned = false
-  if not path or path == "" then
-    path = vim.fn.tempname() .. ".nvimcat.shot"
-    owned = true
-  end
-  vim.cmd("redraw!")
-  vim.api.nvim__screenshot(path)
-  -- CLI PTY mode: shell normalizes NVIMCAT_SHOT; return empty.
-  if vim.env.NVIMCAT_SHOT and vim.env.NVIMCAT_SHOT ~= "" and not owned then
-    return ""
-  end
-  local root = plugin_root() or "."
-  local conv = root .. "/bin/nvimcat-shot2ansi"
-  local ansi = vim.fn.system({ "python3", conv, path })
-  if owned then
-    pcall(os.remove, path)
-  end
-  if vim.v.shell_error ~= 0 then
-    error("nvimcat: shot2ansi failed: " .. tostring(ansi))
-  end
-  return ansi
-end
-
-local function estimate_height(buf)
-  local n = vim.api.nvim_buf_line_count(buf)
-  local extra = 0
-  for _, id in pairs(vim.api.nvim_get_namespaces()) do
-    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, id, 0, -1, { details = true })) do
-      local d = m[4] or {}
-      if d.virt_lines then
-        extra = extra + #d.virt_lines
-      end
-    end
-  end
-  -- Mermaid often expands after first render; reserve room up front.
-  if buffer_needs_mermaid(buf) and extra < 8 then
-    extra = extra + 12
-  end
-  return n + extra + math.floor(n * 0.15) + 8
 end
 
 local function disable_anti_conceal()
@@ -533,13 +458,6 @@ function M.dump(opts)
 
   local need_mermaid = buffer_needs_mermaid(buf)
 
-  -- PTY CLI sizes the terminal up front; don't fight the UI with vim.o.lines.
-  if not vim.env.NVIMCAT_SHOT or vim.env.NVIMCAT_SHOT == "" then
-    local est_h = math.min(opts.max_lines, math.max(24, estimate_height(buf)))
-    vim.o.lines = est_h
-    pcall(vim.api.nvim_win_set_height, win, math.max(1, est_h - 2))
-  end
-
   disable_anti_conceal()
   vim.cmd("normal! gg")
   try_force_render(buf, win)
@@ -552,22 +470,6 @@ function M.dump(opts)
   settle(buf, win, opts, need_mermaid)
   _timing("after_settle ready=" .. tostring(is_ready(buf, need_mermaid)))
 
-  if not vim.env.NVIMCAT_SHOT or vim.env.NVIMCAT_SHOT == "" then
-    local est_h = vim.o.lines
-    local est2 = math.min(opts.max_lines, math.max(est_h, estimate_height(buf)))
-    if est2 > est_h then
-      vim.o.lines = est2
-      pcall(vim.api.nvim_win_set_height, win, math.max(1, est2 - 2))
-      disable_anti_conceal()
-      try_force_render(buf, win)
-      settle(buf, win, {
-        min_wait_ms = 40,
-        settle_ms = 80,
-        timeout_ms = math.min(2000, opts.timeout_ms),
-      }, need_mermaid)
-    end
-  end
-
   -- Keep topline=1. Parking on the last line would scroll the viewport
   -- when the buffer is taller than the window (README-sized docs).
   silence_ui_noise()
@@ -577,42 +479,6 @@ function M.dump(opts)
   pcall(function()
     vim.fn.winrestview({ lnum = 1, col = 0, topline = 1, leftcol = 0 })
   end)
-  -- ponytail: skip another try_force_render here — settle already forced; re-parse
-  -- on large buffers was ~500ms. Hold loop still redraws for TS conceal.
-  mute_lsp_paint(buf)
-  close_floating_windows()
-  _timing("before_hold")
-  -- Hold until the visible grid stops changing (TS conceal isn't in decor fp).
-  do
-    vim.cmd("redraw!")
-    local last = screen_fingerprint()
-    local stable_since = vim.uv.now()
-    local t0 = vim.uv.now()
-    -- ponytail: short hold — ceiling ~500ms; raise if TS conceal still flickers.
-    local hold = math.min(500, 150 + vim.api.nvim_buf_line_count(buf) * 1)
-    local stable_need = 100
-    while vim.uv.now() - t0 < hold do
-      mute_lsp_paint(buf)
-      close_floating_windows()
-      vim.cmd("redraw!")
-      vim.wait(30, function()
-        return false
-      end)
-      local fp = screen_fingerprint()
-      if fp == last then
-        if vim.uv.now() - stable_since >= stable_need then
-          break
-        end
-      else
-        last = fp
-        stable_since = vim.uv.now()
-      end
-    end
-    _timing("hold_exit elapsed=" .. tostring(vim.uv.now() - t0))
-  end
-  close_floating_windows()
-  vim.cmd("redraw!")
-
   -- Re-assert chrome: LazyVim/lualine may flip laststatus back on.
   vim.o.laststatus = 0
   vim.o.showtabline = 0
@@ -621,7 +487,6 @@ function M.dump(opts)
     vim.o.winbar = ""
     vim.wo[win].winbar = ""
   end)
-  vim.cmd("redraw!")
   if vim.env.NVIMCAT_VERBOSE == "1" then
     io.stderr:write(
       string.format(
@@ -633,10 +498,10 @@ function M.dump(opts)
     )
   end
 
-  _timing("before_capture")
-  local ansi = capture_screenshot()
-  _timing("after_capture")
-  return ansi
+  -- Signal embed client: next UI flush is the frame to emit.
+  vim.g.nvimcat_capture = 1
+  vim.cmd("redraw!")
+  return "" -- embed client owns ANSI; dump returns empty in CLI embed mode
 end
 
 --- Dump into a new scratch buffer (interactive `:NvimCat`).
@@ -801,37 +666,8 @@ function M.prep_compare()
     vim.fn.winrestview({ lnum = 1, col = 0, topline = 1, leftcol = 0 })
   end)
   try_force_render(buf, win)
-  vim.wait(40, function()
-    return false
-  end)
+  vim.cmd("redraw!")
   mute_lsp_paint(buf)
-  close_floating_windows()
-  do
-    vim.cmd("redraw!")
-    local last = screen_fingerprint()
-    local stable_since = vim.uv.now()
-    local t0 = vim.uv.now()
-    -- ponytail: match dump() hold — ceiling ~500ms.
-    local hold = math.min(500, 150 + vim.api.nvim_buf_line_count(buf) * 1)
-    local stable_need = 100
-    while vim.uv.now() - t0 < hold do
-      mute_lsp_paint(buf)
-      close_floating_windows()
-      vim.cmd("redraw!")
-      vim.wait(30, function()
-        return false
-      end)
-      local fp = screen_fingerprint()
-      if fp == last then
-        if vim.uv.now() - stable_since >= stable_need then
-          break
-        end
-      else
-        last = fp
-        stable_since = vim.uv.now()
-      end
-    end
-  end
   close_floating_windows()
   vim.o.laststatus = 0
   vim.o.showtabline = 0
