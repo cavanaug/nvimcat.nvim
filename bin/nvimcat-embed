@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import select
 import subprocess
 import sys
 import threading
@@ -185,13 +184,17 @@ def capture(width: int, files: list[str]) -> int:
     env["NVIMCAT_FILES"] = "\x1e".join(files) + ("\x1e" if files else "")
 
     grid = Grid()
+    grid_lock = threading.Lock()
     flush_ev = threading.Event()
     awaiting_resize_flush = False
+    output_parts: list[bytes] = []
 
     def on_notify(method: str, args: list[Any]) -> None:
         if method != "redraw":
             return
-        if _apply_redraw(grid, args):
+        with grid_lock:
+            flushed = _apply_redraw(grid, args)
+        if flushed:
             flush_ev.set()
 
     nv = NvimEmbed(argv=_nvim_argv(root), env=env, on_notify=on_notify)
@@ -208,11 +211,24 @@ def capture(width: int, files: list[str]) -> int:
 
             remaining = max(0.0, deadline - time.time())
             wait = min(0.1, remaining)
-            r, _, _ = select.select([nv._stdout_fd], [], [], wait)
-            if not flush_ev.is_set() and not r:
+            if not flush_ev.wait(timeout=wait):
                 continue
-            if flush_ev.is_set():
-                flush_ev.clear()
+            flush_ev.clear()
+
+            try:
+                done = nv.request("nvim_get_var", "nvimcat_done", timeout=remaining)
+            except (TimeoutError, RuntimeError):
+                done = 0
+            if done == 1:
+                sys.stdout.buffer.write(b"".join(output_parts))
+                sys.stdout.buffer.flush()
+                try:
+                    nv.request("nvim_command", "qa!", timeout=5)
+                except (TimeoutError, RuntimeError):
+                    pass
+                rc = 0
+                break
+
             try:
                 cap = nv.request("nvim_get_var", "nvimcat_capture", timeout=remaining)
             except (TimeoutError, RuntimeError):
@@ -232,14 +248,16 @@ def capture(width: int, files: list[str]) -> int:
                     awaiting_resize_flush = True
                     continue
 
-            sys.stdout.buffer.write(grid.to_ansi())
-            sys.stdout.buffer.flush()
+            with grid_lock:
+                part = grid.to_ansi()
+            if output_parts:
+                output_parts.append(b"\n")
+            output_parts.append(part)
+            awaiting_resize_flush = False
             try:
-                nv.request("nvim_command", "qa!", timeout=5)
+                nv.request("nvim_set_var", "nvimcat_capture", 0, timeout=remaining)
             except (TimeoutError, RuntimeError):
                 pass
-            rc = 0
-            break
         else:
             print("nvimcat-embed: timed out waiting for capture", file=sys.stderr)
     finally:

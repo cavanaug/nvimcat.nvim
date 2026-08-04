@@ -630,11 +630,22 @@ function M.cli()
         -- PTY CLI: one file per invocation; write raw TUI screenshot for the shell.
         M.dump(vim.tbl_extend("force", opts, { file = files[1] }))
       else
+        local embed = vim.env.NVIMCAT_EMBED == "1"
         for i, file in ipairs(files) do
-          if i > 1 then
+          if not embed and i > 1 then
             io.stdout:write("\n")
           end
-          io.stdout:write(M.dump(vim.tbl_extend("force", opts, { file = file })))
+          local dumped = M.dump(vim.tbl_extend("force", opts, { file = file }))
+          if embed then
+            local t0 = vim.uv.now()
+            while vim.g.nvimcat_capture == 1 and (vim.uv.now() - t0) < 30000 do
+              vim.wait(20, function()
+                return vim.g.nvimcat_capture ~= 1
+              end, 50)
+            end
+          else
+            io.stdout:write(dumped)
+          end
         end
       end
     end)
@@ -643,7 +654,10 @@ function M.cli()
       vim.cmd("cquit 1")
       return
     end
-    if vim.env.NVIMCAT_EMBED ~= "1" then
+    if vim.env.NVIMCAT_EMBED == "1" then
+      vim.g.nvimcat_done = 1
+      vim.cmd("redraw!")
+    else
       vim.cmd("qa!")
     end
   end)
