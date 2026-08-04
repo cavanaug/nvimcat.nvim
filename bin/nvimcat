@@ -10,10 +10,9 @@ export NVIMCAT_ROOT="$ROOT"
 if [[ -z "${NVIMCAT_WIDTH:-}" ]]; then
   cols=""
   # Prefer controlling TTY so `nvimcat file | less -R` still matches the terminal.
-  if cols="$(stty size < /dev/tty 2>/dev/null | awk '{print $2}')"; then
-    :
-  else
-    cols=""
+  if exec 3</dev/tty 2>/dev/null; then
+    cols="$(stty size <&3 2>/dev/null | awk '{print $2}' || true)"
+    exec 3<&-
   fi
   if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
     cols="$(tput cols 2>/dev/null || true)"
