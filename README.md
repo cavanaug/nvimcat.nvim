@@ -12,29 +12,40 @@ Not glow. Not mdcat. Not a second markdown engine. Your nvim is the renderer.
 
 ## Install
 
-### Lazy.nvim (plugin + optional CLI)
+### Lazy.nvim / LazyVim
 
 ```lua
 {
   "cavanaug/nvimcat.nvim", -- or { dir = "~/path/to/nvimcat.nvim" }
   cmd = "NvimCat",
-  opts = {
-    -- disable_plugins = { "copilot.lua", ... },
-  },
+  opts = {},
+  build = function()
+    require("nvimcat").install_cli()
+  end,
 }
 ```
 
-Put `bin/nvimcat` on your PATH (symlink is fine):
+On install/update (`build`) and whenever `setup()` runs, Nvimcat symlinks
+`~/.local/bin/nvimcat` → the plugin’s `bin/nvimcat` (skips if something else
+already occupies that path). Ensure `~/.local/bin` is on your shell `PATH`.
 
-```bash
-ln -sf /path/to/nvimcat.nvim/bin/nvimcat ~/.local/bin/nvimcat
+Opt out of the setup-time link:
+
+```lua
+opts = { install_cli = false }
 ```
+
+(Also remove/override `build` if you do not want install-time linking.)
 
 The CLI also `rtp:prepend`s the repo, so it works even if Lazy hasn’t loaded the plugin yet.
 
 ### CLI-only
 
-Same symlink; no Lazy entry required. The Lua package loads from the repo beside `bin/`.
+```bash
+ln -sf /path/to/nvimcat.nvim/bin/nvimcat ~/.local/bin/nvimcat
+```
+
+No Lazy entry required. The Lua package loads from the repo beside `bin/`.
 
 ## Usage
 
