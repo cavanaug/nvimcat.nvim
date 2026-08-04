@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Neovim --embed UI client (msgpack-rpc over stdio)."""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import threading
+import time
+from typing import Any, Callable
+
+_BIN = os.path.dirname(os.path.abspath(__file__))
+if _BIN not in sys.path:
+    sys.path.insert(0, _BIN)
+
+import nvimcat_msgpack as mp  # noqa: E402
+
+
+class NvimEmbed:
+    def __init__(
+        self,
+        argv: list[str] | None = None,
+        on_notify: Callable[[str, list[Any]], None] | None = None,
+    ) -> None:
+        self._on_notify = on_notify or (lambda _m, _a: None)
+        self._unpacker = mp.Unpacker()
+        self._next_id = 1
+        self._pending: dict[int, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._proc = subprocess.Popen(
+            argv or ["nvim", "--embed", "--clean", "-n", "--headless"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        assert self._proc.stdin and self._proc.stdout
+        self._stdin = self._proc.stdin
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def _read_loop(self) -> None:
+        assert self._proc.stdout
+        while True:
+            chunk = self._proc.stdout.read(1 << 16)
+            if not chunk:
+                break
+            self._unpacker.feed(chunk)
+            while True:
+                try:
+                    msg = self._unpacker.unpack()
+                except mp.NeedMoreData:
+                    break
+                self._dispatch(msg)
+
+    def _dispatch(self, msg: Any) -> None:
+        if not isinstance(msg, list) or not msg:
+            return
+        kind = msg[0]
+        if kind == 1 and len(msg) >= 4:  # response
+            req_id = msg[1]
+            with self._lock:
+                slot = self._pending.pop(req_id, None)
+            if slot is not None:
+                slot["error"] = msg[2]
+                slot["result"] = msg[3]
+                slot["event"].set()
+        elif kind == 2 and len(msg) >= 3:  # notification
+            self._on_notify(msg[1], msg[2] if isinstance(msg[2], list) else [])
+        elif kind == 0 and len(msg) >= 4:  # request from nvim (e.g. "vimenter")
+            req_id, method, args = msg[1], msg[2], msg[3]
+            result = None
+            error = None
+            if method == "redraw":
+                pass
+            self._send([1, req_id, error, result])
+
+    def _send(self, obj: Any) -> None:
+        self._stdin.write(mp.pack(obj))
+        self._stdin.flush()
+
+    def request(self, method: str, *args: Any) -> Any:
+        req_id = self._next_id
+        self._next_id += 1
+        ev = threading.Event()
+        slot = {"event": ev, "error": None, "result": None}
+        with self._lock:
+            self._pending[req_id] = slot
+        self._send([0, req_id, method, list(args)])
+        deadline = time.time() + 30
+        while not ev.is_set():
+            if time.time() >= deadline:
+                raise TimeoutError(f"RPC timeout: {method}")
+            if self._proc.poll() is not None:
+                with self._lock:
+                    self._pending.pop(req_id, None)
+                if slot["error"] is not None:
+                    raise RuntimeError(slot["error"])
+                return slot["result"]
+            ev.wait(timeout=0.05)
+        if slot["error"] is not None:
+            raise RuntimeError(slot["error"])
+        return slot["result"]
+
+    def ui_attach(self, width: int, height: int, **options: Any) -> None:
+        opts = {"rgb": True, "ext_linegrid": True, **options}
+        self.request("nvim_ui_attach", width, height, opts)
+
+    def close(self) -> None:
+        try:
+            self._stdin.close()
+        except OSError:
+            pass
+        self._proc.wait(timeout=5)
+
+
+def smoke(width: int) -> int:
+    nv = NvimEmbed()
+    try:
+        nv.ui_attach(width, 24)
+        nv.request("nvim_command", "qa!")
+    finally:
+        nv.close()
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--smoke":
+        return smoke(int(sys.argv[2]))
+    print("usage: nvimcat-embed --smoke WIDTH", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
