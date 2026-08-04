@@ -358,12 +358,6 @@ local function disable_side_effect_plugins(opts)
   pcall(function()
     require("copilot.command").disable()
   end)
-  -- Stop every LSP client (rumdl/marksman indexing pollutes the grid and burns CPU).
-  for _, client in ipairs(vim.lsp.get_clients()) do
-    pcall(function()
-      client:stop(true)
-    end)
-  end
   -- nvim-lint (cspell) on a multi-thousand-line markdown file is catastrophic.
   pcall(function()
     require("lint").linters_by_ft = {}
@@ -655,16 +649,14 @@ function M.cli()
   end
 
   disable_side_effect_plugins(config)
-  -- Stop LSP before attach paints / indexes; mute any that slip through.
+  -- Mute LSP paint before it reaches the capture; stopping clients emits a
+  -- quit warning that the embedded UI client would capture as document data.
   vim.api.nvim_create_autocmd("LspAttach", {
     group = vim.api.nvim_create_augroup("nvimcat_mute_lsp", { clear = true }),
     callback = function(args)
       local client = vim.lsp.get_client_by_id(args.data.client_id)
       if client then
         client.server_capabilities.semanticTokensProvider = nil
-        pcall(function()
-          client:stop(true)
-        end)
       end
       pcall(vim.lsp.semantic_tokens.stop, args.buf, args.data.client_id)
     end,
