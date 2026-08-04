@@ -8,6 +8,9 @@ local M = {}
 ---@field install_cli? boolean
 ---@field disable_plugins? string[]
 
+-- Neovim clamps &lines / UI height at 1000; requesting more only burns CPU.
+local UI_MAX_LINES = 1000
+
 local DEFAULTS = {
   -- width: nil → NVIMCAT_WIDTH / COLUMNS / vim.o.columns (see prepare_chrome)
   timeout_ms = 8000,
@@ -22,6 +25,9 @@ local DEFAULTS = {
     "avante.nvim",
     "supermaven-nvim",
     "tabnine-nvim",
+    -- Lint/spell on large markdown (cspell via nvim-lint) dwarfs render time.
+    "nvim-lint",
+    "mason-nvim-lint",
   },
 }
 
@@ -139,7 +145,9 @@ local function ensure_mermaid_setup()
   return mod
 end
 
-local function try_force_render(buf, win)
+local ts_parsed = false
+
+local function try_force_render(buf, win, need_mermaid)
   if not plugins_loaded then
     ensure_lazy_markdown_plugins()
     plugins_loaded = true
@@ -148,20 +156,25 @@ local function try_force_render(buf, win)
     vim.wo[win].conceallevel = 2
     vim.wo[win].concealcursor = ""
   end)
+  -- Full-buffer parse once; repeating it every settle poll dominates large files.
+  if not ts_parsed then
+    pcall(function()
+      vim.treesitter.get_parser(buf, "markdown"):parse(true)
+    end)
+    ts_parsed = true
+  end
   pcall(function()
     require("render-markdown.core.ui").update(buf, win, "nvimcat", true)
   end)
   pcall(function()
     require("render-markdown").set(true)
   end)
-  -- Treesitter + direct mermaid render (bypass debounce timer).
-  pcall(function()
-    vim.treesitter.get_parser(buf, "markdown"):parse(true)
-  end)
-  pcall(function()
-    local mod = ensure_mermaid_setup()
-    require("render-markdown-mermaid.display").render(buf, mod.config)
-  end)
+  if need_mermaid then
+    pcall(function()
+      local mod = ensure_mermaid_setup()
+      require("render-markdown-mermaid.display").render(buf, mod.config)
+    end)
+  end
   pcall(vim.api.nvim_exec_autocmds, "BufWinEnter", { buffer = buf })
 end
 
@@ -237,21 +250,27 @@ local function is_ready(buf, need_mermaid)
   if need_mermaid then
     return has_mermaid_decor(buf)
   end
-  return has_table_decor(buf) or has_rm_marks(buf)
+  -- Prefer cheap mark presence; table box scan is O(all extmarks).
+  return has_rm_marks(buf) or has_table_decor(buf)
 end
 
 local function settle(buf, win, opts, need_mermaid)
+  -- Force once, then only poll. Re-forcing every tick (debounce=0) schedules
+  -- unbounded ui.update callbacks and can prevent decorations from stabilizing.
   if not is_ready(buf, need_mermaid) then
-    try_force_render(buf, win)
+    try_force_render(buf, win, need_mermaid)
   end
   local ok = vim.wait(opts.timeout_ms, function()
-    if is_ready(buf, need_mermaid) then
-      return true
-    end
-    try_force_render(buf, win)
-    return false
-  end, 10)
+    return is_ready(buf, need_mermaid)
+  end, 20)
   if not ok then
+    -- One last nudge, then brief wait — still no per-tick thrash.
+    try_force_render(buf, win, need_mermaid)
+    vim.wait(math.min(500, opts.timeout_ms), function()
+      return is_ready(buf, need_mermaid)
+    end, 20)
+  end
+  if not is_ready(buf, need_mermaid) then
     io.stderr:write(
       "nvimcat: settle timeout (ready="
         .. tostring(is_ready(buf, need_mermaid))
@@ -339,11 +358,17 @@ local function disable_side_effect_plugins(opts)
   pcall(function()
     require("copilot.command").disable()
   end)
-  for _, client in ipairs(vim.lsp.get_clients({ name = "copilot" })) do
+  -- Stop every LSP client (rumdl/marksman indexing pollutes the grid and burns CPU).
+  for _, client in ipairs(vim.lsp.get_clients()) do
     pcall(function()
       client:stop(true)
     end)
   end
+  -- nvim-lint (cspell) on a multi-thousand-line markdown file is catastrophic.
+  pcall(function()
+    require("lint").linters_by_ft = {}
+  end)
+  pcall(vim.diagnostic.enable, false)
 end
 
 local function silence_ui_noise()
@@ -460,7 +485,7 @@ function M.dump(opts)
 
   disable_anti_conceal()
   vim.cmd("normal! gg")
-  try_force_render(buf, win)
+  try_force_render(buf, win, need_mermaid)
   _timing(
     "before_settle ready="
       .. tostring(is_ready(buf, need_mermaid))
@@ -513,9 +538,11 @@ function M.dump(opts)
       extra = extra + 12
     end
     local cap = opts.max_lines or 5000
-    return math.max(24, math.min(cap, n + extra + math.floor(n * 0.15) + 8))
+    -- Neovim UI height hard-caps at 1000; higher nvimcat_rows only slows resize.
+    return math.max(24, math.min(UI_MAX_LINES, math.min(cap, n + extra + math.floor(n * 0.15) + 8)))
   end
   vim.g.nvimcat_rows = estimate_height(buf)
+  vim.g.nvimcat_buf_lines = vim.api.nvim_buf_line_count(buf)
 
   if vim.env.NVIMCAT_EMBED == "1" then
     -- Embed client owns ANSI; next UI flush is the frame to emit.
@@ -583,7 +610,8 @@ local function when_ready(cb)
       return
     end
     done = true
-    vim.defer_fn(cb, 20)
+    -- Dump as soon as Lazy init is done; no extra pad.
+    vim.schedule(cb)
   end
 
   vim.api.nvim_create_autocmd("User", {
@@ -598,15 +626,15 @@ local function when_ready(cb)
       if done then
         return
       end
-      if lazy_init_done() or (vim.uv.now() - t0) >= 600 then
+      if lazy_init_done() or (vim.uv.now() - t0) >= 400 then
         once()
         return
       end
-      vim.defer_fn(poll, 40)
+      vim.defer_fn(poll, 20)
     end
     poll()
     -- Hard cap so we never hang if Lazy signals never fire in headless.
-    vim.defer_fn(once, 900)
+    vim.defer_fn(once, 700)
   end
 
   if vim.v.vim_did_enter == 1 then
@@ -627,13 +655,16 @@ function M.cli()
   end
 
   disable_side_effect_plugins(config)
-  -- Prevent marksman semantic tokens from ever painting cites.
+  -- Stop LSP before attach paints / indexes; mute any that slip through.
   vim.api.nvim_create_autocmd("LspAttach", {
     group = vim.api.nvim_create_augroup("nvimcat_mute_lsp", { clear = true }),
     callback = function(args)
       local client = vim.lsp.get_client_by_id(args.data.client_id)
       if client then
         client.server_capabilities.semanticTokensProvider = nil
+        pcall(function()
+          client:stop(true)
+        end)
       end
       pcall(vim.lsp.semantic_tokens.stop, args.buf, args.data.client_id)
     end,
@@ -664,8 +695,9 @@ function M.cli()
         end
         local dumped = M.dump(vim.tbl_extend("force", opts, { file = file }))
         if embed then
+          local cap_ms = math.floor((tonumber(vim.env.NVIMCAT_TIMEOUT) or 60) * 1000)
           local t0 = vim.uv.now()
-          while vim.g.nvimcat_capture == 1 and (vim.uv.now() - t0) < 30000 do
+          while vim.g.nvimcat_capture == 1 and (vim.uv.now() - t0) < cap_ms do
             vim.wait(20, function()
               return vim.g.nvimcat_capture ~= 1
             end, 50)
@@ -713,7 +745,7 @@ function M.prep_compare()
   pcall(function()
     vim.fn.winrestview({ lnum = 1, col = 0, topline = 1, leftcol = 0 })
   end)
-  try_force_render(buf, win)
+  try_force_render(buf, win, buffer_needs_mermaid(buf))
   vim.cmd("redraw!")
   mute_lsp_paint(buf)
   close_floating_windows()

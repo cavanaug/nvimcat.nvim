@@ -733,6 +733,14 @@ class NvimEmbed:
         self._proc.wait(timeout=5)
 
 
+# Neovim clamps UI height (&lines) at 1000. Above that, try_resize is futile and
+# truncates output unless we scroll-stitch pages.
+_UI_MAX_LINES = 1000
+# Dense pipe-tables scale poorly with viewport height in render-markdown; 250 is a
+# decent wall-clock tradeoff vs round-trips (see perf notes on tall files).
+_PAGE_LINES = 250
+
+
 def _estimate_rows(paths: list[str]) -> int:
     total = 0
     for path in paths:
@@ -743,7 +751,11 @@ def _estimate_rows(paths: list[str]) -> int:
             total += 40
     if not paths:
         total = 40
-    return max(24, min(200, total + 32))
+    want = total + 32
+    if want <= _UI_MAX_LINES:
+        return max(24, want)
+    # Tall files: fixed page height; capture() scrolls until EOF.
+    return _PAGE_LINES
 
 
 def _nvim_argv(root: str) -> list[str]:
@@ -790,10 +802,64 @@ def _apply_redraw(grid: Grid, events: list[Any]) -> bool:
     return flushed
 
 
+def _win_page_info(nv: "NvimEmbed", timeout: float) -> dict[str, int]:
+    """Buffer topline / bottom / last via window view (1-based line numbers)."""
+    info = nv.request(
+        "nvim_exec_lua",
+        """
+local view = vim.fn.winsaveview()
+return {
+  top = view.topline or 1,
+  bot = vim.fn.line('w$'),
+  last = vim.fn.line('$'),
+}
+""",
+        [],
+        timeout=timeout,
+    )
+    if not isinstance(info, dict):
+        return {"top": 1, "bot": 1, "last": 1}
+    return {
+        "top": int(info.get("top") or 1),
+        "bot": int(info.get("bot") or 1),
+        "last": int(info.get("last") or 1),
+    }
+
+
+def _scroll_page(nv: "NvimEmbed", next_top: int, timeout: float) -> None:
+    """Scroll so topline=next_top and force a render-markdown update for the new viewport."""
+    nv.request(
+        "nvim_exec_lua",
+        f"""
+local top = {int(next_top)}
+local win = vim.api.nvim_get_current_win()
+local buf = vim.api.nvim_get_current_buf()
+vim.fn.winrestview({{ lnum = top, col = 0, topline = top, leftcol = 0 }})
+pcall(function()
+  require("render-markdown.core.ui").update(buf, win, "nvimcat-page", true)
+end)
+-- Let scheduled ui.update run before we snapshot the grid.
+vim.wait(200, function()
+  for name, id in pairs(vim.api.nvim_get_namespaces()) do
+    if name:find("render%-markdown", 1, false) then
+      if #vim.api.nvim_buf_get_extmarks(buf, id, 0, -1, {{}}) > 0 then
+        return true
+      end
+    end
+  end
+  return false
+end, 10)
+vim.cmd("redraw!")
+""",
+        [],
+        timeout=timeout,
+    )
+
+
 def capture(width: int, files: list[str]) -> int:
     root = os.environ.get("NVIMCAT_ROOT") or str(_ROOT)
     height = _estimate_rows(files)
-    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "30"))
+    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "60"))
 
     env = os.environ.copy()
     env["NVIMCAT"] = "1"
@@ -807,6 +873,7 @@ def capture(width: int, files: list[str]) -> int:
     flush_ev = threading.Event()
     awaiting_resize_flush = False
     output_parts: list[bytes] = []
+    pages_done = 0
 
     def on_notify(method: str, args: list[Any]) -> None:
         if method != "redraw":
@@ -860,23 +927,66 @@ def capture(width: int, files: list[str]) -> int:
                     rows = nv.request("nvim_get_var", "nvimcat_rows", timeout=remaining)
                 except (TimeoutError, RuntimeError):
                     rows = None
-                if isinstance(rows, int) and rows > 0 and rows != height:
+                try:
+                    buf_lines = nv.request(
+                        "nvim_get_var", "nvimcat_buf_lines", timeout=remaining
+                    )
+                except (TimeoutError, RuntimeError):
+                    buf_lines = None
+                # Whole buffer fits in one UI page → resize once. Tall buffers keep
+                # the page height and scroll-stitch (Neovim clamps &lines at 1000).
+                fits = (
+                    isinstance(rows, int)
+                    and rows > 0
+                    and rows != height
+                    and rows <= _UI_MAX_LINES
+                    and not (isinstance(buf_lines, int) and buf_lines > height)
+                )
+                if fits:
                     nv.request("nvim_ui_try_resize", width, rows, timeout=remaining)
                     height = rows
                     nv.request("nvim_command", "redraw!", timeout=remaining)
                     awaiting_resize_flush = True
                     continue
 
-            with grid_lock:
-                part = grid.to_ansi()
-            if output_parts:
-                output_parts.append(b"\n")
-            output_parts.append(part)
-            awaiting_resize_flush = False
+            # Capture current viewport, then scroll until EOF (or single page).
+            while time.time() < deadline:
+                with grid_lock:
+                    part = grid.to_ansi()
+                if output_parts:
+                    output_parts.append(b"\n")
+                output_parts.append(part)
+                pages_done += 1
+                awaiting_resize_flush = False
+
+                try:
+                    info = _win_page_info(nv, max(0.0, deadline - time.time()))
+                except (TimeoutError, RuntimeError):
+                    info = {"top": 1, "bot": 1, "last": 1}
+                if info["bot"] >= info["last"] or pages_done >= 500:
+                    break
+
+                flush_ev.clear()
+                try:
+                    _scroll_page(nv, info["bot"] + 1, max(0.0, deadline - time.time()))
+                except (TimeoutError, RuntimeError) as exc:
+                    print(f"nvimcat: scroll failed: {exc}", file=sys.stderr)
+                    break
+                if not flush_ev.wait(timeout=min(2.0, max(0.0, deadline - time.time()))):
+                    # No flush — still try to capture whatever is on the grid.
+                    pass
+                flush_ev.clear()
+
             try:
-                nv.request("nvim_set_var", "nvimcat_capture", 0, timeout=remaining)
+                nv.request(
+                    "nvim_set_var",
+                    "nvimcat_capture",
+                    0,
+                    timeout=max(0.0, deadline - time.time()),
+                )
             except (TimeoutError, RuntimeError):
                 pass
+            continue
         else:
             print("nvimcat: timed out waiting for capture", file=sys.stderr)
     finally:
