@@ -3,7 +3,17 @@
 # Uses a PTY + nvim__screenshot so output matches the real TUI cell grid.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve symlinks so ~/.local/bin/nvimcat → plugin tree, not ~/.local.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  TARGET="$(readlink "$SOURCE")"
+  if [[ "$TARGET" != /* ]]; then
+    SOURCE="$(cd "$(dirname "$SOURCE")" && pwd)/$TARGET"
+  else
+    SOURCE="$TARGET"
+  fi
+done
+ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
 export NVIMCAT=1
 export NVIMCAT_ROOT="$ROOT"
 

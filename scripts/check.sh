@@ -28,7 +28,8 @@ checks = {
     "nonempty": bool(plain.strip()),
     "has_sgr": "\x1b[" in raw,
     "heading": "Heading" in plain or "Sample" in plain or "Terminal" in plain,
-    "perf_under_90s": elapsed < 90000,
+    # Cold start + mermaid settle should still finish well under 4s.
+    "perf_under_4s": elapsed < 4000,
 }
 for k, v in checks.items():
     print(("OK" if v else "FAIL"), k)

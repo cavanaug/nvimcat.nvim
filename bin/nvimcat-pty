@@ -50,9 +50,7 @@ def run_one(root: str, width: int, path: str, shot: str) -> int:
         "--cmd",
         f"set rtp^={root}",
         "-c",
-        "lua vim.opt.rtp:prepend(vim.env.NVIMCAT_ROOT or vim.g.nvimcat_root)",
-        "-c",
-        "lua require('nvimcat').cli()",
+        f"luafile {root}/scripts/cli-entry.lua",
     ]
 
     pid, fd = os.forkpty()
@@ -65,7 +63,6 @@ def run_one(root: str, width: int, path: str, shot: str) -> int:
     deadline = time.time() + float(os.environ.get("NVIMCAT_TIMEOUT", "90"))
     while time.time() < deadline:
         if os.path.exists(shot) and os.path.getsize(shot) > 32:
-            time.sleep(0.2)
             break
         r, _, _ = select.select([fd], [], [], 0.25)
         if r:
