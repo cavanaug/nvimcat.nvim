@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # nvimcat — dump a file as ANSI using your full Neovim config (plugins, themes, …).
+# Uses a PTY + nvim__screenshot so output matches the real TUI cell grid.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export NVIMCAT=1
 export NVIMCAT_ROOT="$ROOT"
 
-# Width: explicit NVIMCAT_WIDTH > controlling TTY > tput > COLUMNS > lua fallback.
+# Width: explicit NVIMCAT_WIDTH > controlling TTY > tput > COLUMNS > 80.
 if [[ -z "${NVIMCAT_WIDTH:-}" ]]; then
   cols=""
-  # Prefer controlling TTY so `nvimcat file | less -R` still matches the terminal.
-  # Subshell + stderr redirect: bash otherwise prints when /dev/tty is missing.
   cols="$(bash -c 'stty size < /dev/tty' 2>/dev/null | awk '{print $2}' || true)"
   if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
     cols="$(tput cols 2>/dev/null || true)"
@@ -18,9 +17,10 @@ if [[ -z "${NVIMCAT_WIDTH:-}" ]]; then
   if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
     cols="${COLUMNS:-}"
   fi
-  if [[ "${cols}" =~ ^[1-9][0-9]*$ ]]; then
-    export NVIMCAT_WIDTH="$cols"
+  if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
+    cols=80
   fi
+  export NVIMCAT_WIDTH="$cols"
 fi
 
 if ! command -v nvim >/dev/null 2>&1; then
@@ -33,9 +33,6 @@ if [[ $# -lt 1 ]]; then
   exit 2
 fi
 
-# Resolve paths now; do NOT pass files as nvim argv.
-# Argv files are opened before -c runs, which fires BufReadPost and starts
-# Copilot (and similar) auth before we can disable them.
 files=()
 for f in "$@"; do
   if [[ -e "$f" ]]; then
@@ -44,17 +41,8 @@ for f in "$@"; do
     files+=("$f")
   fi
 done
-# RS-separated list (avoid NUL — bash warns in $(...)).
-export NVIMCAT_FILES="$(printf '%s\x1e' "${files[@]}")"
 
-# LazyVim rebuilds rtp during startup, so we prepend again in -c before require.
-ROOT_VIM="${ROOT//\\/\\\\}"
-ROOT_VIM="${ROOT_VIM//\'/\\\'}"
+SHOT="$(mktemp -t nvimcat.XXXXXX.shot)"
+trap 'rm -f "$SHOT"' EXIT
 
-exec nvim --headless \
-  --cmd "let g:nvimcat = 1" \
-  --cmd "let g:nvimcat_root = '${ROOT_VIM}'" \
-  --cmd "let g:copilot_enabled = v:false" \
-  --cmd "set rtp^=${ROOT}" \
-  -c "lua vim.opt.rtp:prepend(vim.env.NVIMCAT_ROOT or vim.g.nvimcat_root)" \
-  -c "lua require('nvimcat').cli()"
+exec python3 "$ROOT/bin/nvimcat-pty" "$NVIMCAT_WIDTH" "$SHOT" "${files[@]}"

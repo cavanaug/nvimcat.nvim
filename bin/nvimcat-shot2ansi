@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Normalize nvim__screenshot output to line-based ANSI (one row per line)."""
+from __future__ import annotations
+
+import re
+import sys
+
+# Drop terminal mode / cursor / charset noise; keep SGR (m) and text.
+CSI_DROP = re.compile(
+    rb"\x1b\[\?(?:25[lh]|[0-9;]*[hl])"  # DEC private modes (cursor, etc.)
+    rb"|\x1b\[[0-9;]*[HfJABCD]"  # cursor / erase
+    rb"|\x1b\(B"  # G0 charset → ASCII
+)
+SGR = re.compile(rb"\x1b\[[0-9;]*m")
+
+
+def plain(line: bytes) -> bytes:
+    return SGR.sub(b"", line)
+
+
+def sgr_resets(seq: bytes) -> bool:
+    """True if this SGR clears prior attrs (0 / empty)."""
+    if seq in (b"\x1b[m", b"\x1b[0m"):
+        return True
+    # \x1b[0;...m starts from defaults
+    return seq.startswith(b"\x1b[0;") or seq.startswith(b"\x1b[0m")
+
+
+def split_preserving_sgr(body: bytes) -> list[bytes]:
+    """Split CR LF rows, carrying SGR state into the next line.
+
+    nvim__screenshot omits SGR when the next cell matches the previous
+    cell's attrs — including across wrapped rows — so naive splits drop
+    leading style on the following line.
+    """
+    sgr_state = b""
+    line = bytearray()
+    out: list[bytes] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i : i + 2] == b"\r\n":
+            out.append(bytes(line))
+            # Next row inherits current attrs until an explicit SGR.
+            line = bytearray(sgr_state)
+            i += 2
+            continue
+        if body[i] == 0x0A:  # lone LF
+            out.append(bytes(line))
+            line = bytearray(sgr_state)
+            i += 1
+            continue
+        m = SGR.match(body, i)
+        if m:
+            seq = m.group(0)
+            line.extend(seq)
+            if sgr_resets(seq):
+                sgr_state = b"" if seq in (b"\x1b[m", b"\x1b[0m") else seq
+            else:
+                sgr_state += seq
+            i = m.end()
+            continue
+        line.append(body[i])
+        i += 1
+    if line:
+        out.append(bytes(line))
+    return out
+
+
+def main() -> int:
+    data = open(sys.argv[1], "rb").read() if len(sys.argv) > 1 else sys.stdin.buffer.read()
+    if not data:
+        return 1
+    nl = data.find(b"\n")
+    if nl < 0:
+        return 1
+    header, body = data[:nl].decode("ascii", "replace"), data[nl + 1 :]
+    try:
+        height, width = (int(x) for x in header.split(",", 1))
+    except ValueError:
+        height, width = 0, 0
+    del height, width
+
+    # Screenshot starts with clear-screen; content follows.
+    idx = body.find(b"\x1b[2J")
+    if idx >= 0:
+        body = body[idx + 4 :]
+
+    body = CSI_DROP.sub(b"", body)
+    raw_lines = split_preserving_sgr(body)
+    out: list[bytes] = []
+    for raw in raw_lines:
+        if not raw:
+            continue
+        raw = raw.rstrip(b"\r")
+        p = plain(raw)
+        # End-of-buffer filler
+        if re.fullmatch(rb"~[\s~]*", p):
+            break
+        # Drop cmdline / error / status crumbs that sometimes land on last rows
+        if p.startswith(b"E1568:") or p.startswith(b"E[0-9]"):
+            break
+        if b"Terminal did not respond" in p:
+            break
+        # Statusline leak (laststatus not fully cleared)
+        if p.startswith(b"NORMAL") or p.lstrip().startswith(b"NORMAL "):
+            break
+        out.append(raw)
+
+    # Trim trailing blank (whitespace-only) rows
+    while out and not plain(out[-1]).strip():
+        out.pop()
+
+    sys.stdout.buffer.write(b"\n".join(out) + (b"\n" if out else b""))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Run nvim on a PTY so nvim__screenshot can dump the real TUI grid."""
+from __future__ import annotations
+
+import fcntl
+import os
+import select
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+
+def estimate_rows(path: str, width: int) -> int:
+    try:
+        with open(path, "rb") as fh:
+            total = sum(1 for _ in fh)
+    except OSError:
+        total = 40
+    return min(5000, max(40, total + total // 2 + 48 + width // 20))
+
+
+def run_one(root: str, width: int, path: str, shot: str) -> int:
+    try:
+        os.remove(shot)
+    except FileNotFoundError:
+        pass
+
+    rows = int(os.environ.get("NVIMCAT_HEIGHT") or estimate_rows(path, width))
+    env = os.environ.copy()
+    env["NVIMCAT"] = "1"
+    env["NVIMCAT_ROOT"] = root
+    env["NVIMCAT_WIDTH"] = str(width)
+    env["NVIMCAT_SHOT"] = shot
+    env["NVIMCAT_FILES"] = path + "\x1e"
+    env.setdefault("TERM", "xterm-direct")
+    env.setdefault("COLORTERM", "truecolor")
+
+    root_esc = root.replace("\\", "\\\\").replace("'", "\\'")
+    argv = [
+        "nvim",
+        "-n",
+        "--cmd",
+        "let g:nvimcat = 1",
+        "--cmd",
+        f"let g:nvimcat_root = '{root_esc}'",
+        "--cmd",
+        "let g:copilot_enabled = v:false",
+        "--cmd",
+        f"set rtp^={root}",
+        "-c",
+        "lua vim.opt.rtp:prepend(vim.env.NVIMCAT_ROOT or vim.g.nvimcat_root)",
+        "-c",
+        "lua require('nvimcat').cli()",
+    ]
+
+    pid, fd = os.forkpty()
+    if pid == 0:
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, width, 0, 0))
+        os.environ.update(env)
+        os.execvp("nvim", argv)
+        os._exit(127)
+
+    deadline = time.time() + float(os.environ.get("NVIMCAT_TIMEOUT", "90"))
+    while time.time() < deadline:
+        if os.path.exists(shot) and os.path.getsize(shot) > 32:
+            time.sleep(0.2)
+            break
+        r, _, _ = select.select([fd], [], [], 0.25)
+        if r:
+            try:
+                if not os.read(fd, 1 << 16):
+                    break
+            except OSError:
+                break
+        wpid, _ = os.waitpid(pid, os.WNOHANG)
+        if wpid:
+            break
+    else:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+        print("nvimcat: timed out waiting for screenshot", file=sys.stderr)
+        return 1
+
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    while True:
+        r, _, _ = select.select([fd], [], [], 0)
+        if not r:
+            break
+        try:
+            if not os.read(fd, 1 << 16):
+                break
+        except OSError:
+            break
+
+    if not os.path.exists(shot) or os.path.getsize(shot) < 8:
+        print("nvimcat: screenshot missing", file=sys.stderr)
+        return 1
+
+    conv = os.path.join(root, "bin", "nvimcat-shot2ansi")
+    return subprocess.call([sys.executable, conv, shot])
+
+
+def main() -> int:
+    if len(sys.argv) < 4:
+        print("usage: nvimcat-pty <width> <shot_path> <file>...", file=sys.stderr)
+        return 2
+    width = int(sys.argv[1])
+    shot = sys.argv[2]
+    files = sys.argv[3:]
+    root = os.environ.get("NVIMCAT_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rc = 0
+    for i, path in enumerate(files):
+        if i:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        one_shot = shot if len(files) == 1 else f"{shot}.{i}"
+        rc = run_one(root, width, path, one_shot) or rc
+        if one_shot != shot:
+            try:
+                os.remove(one_shot)
+            except FileNotFoundError:
+                pass
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
