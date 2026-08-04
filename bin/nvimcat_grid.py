@@ -69,11 +69,20 @@ class Grid:
         if len(line) < width:
             line.extend([(" ", 0)] * (width - len(line)))
         col = col_start
+        last_hl_id = 0
         for cell in cells:
             text = str(cell[0])
-            hl_id = int(cell[1])
+            if len(cell) > 1:
+                last_hl_id = int(cell[1])
+            hl_id = last_hl_id
             repeat = int(cell[2]) if len(cell) > 2 else 1
             for _ in range(repeat):
+                if not text:
+                    if col >= width:
+                        break
+                    line[col] = ("", hl_id)
+                    col += 1
+                    continue
                 for ch in text:
                     if col >= width:
                         break
@@ -92,9 +101,11 @@ class Grid:
         self._width.pop(grid, None)
         self._height.pop(grid, None)
 
-    def _sgr(self, hl_id: int) -> bytes:
+    def _sgr(self, hl_id: int, *, reset: bool = False) -> bytes:
         attrs = self._hl.get(hl_id, {})
         parts: list[str] = []
+        if reset:
+            parts.append("0")
         if attrs.get("bold"):
             parts.append("1")
         if attrs.get("italic"):
@@ -109,7 +120,7 @@ class Grid:
         if "bg" in attrs:
             c = attrs["bg"]
             parts.append(f"48;2;{(c >> 16) & 0xFF};{(c >> 8) & 0xFF};{c & 0xFF}")
-        if not parts:
+        if not parts or (reset and len(parts) == 1):
             return b"\x1b[0m"
         return f"\x1b[{';'.join(parts)}m".encode()
 
@@ -125,7 +136,10 @@ class Grid:
                 if buf:
                     out.extend(buf)
                     buf.clear()
-                out.extend(self._sgr(hl_id))
+                if hl_id == 0:
+                    out.extend(b"\x1b[0m")
+                else:
+                    out.extend(self._sgr(hl_id, reset=cur_hl is not None))
                 cur_hl = hl_id
             buf.extend(ch.encode("utf-8"))
         if buf:
