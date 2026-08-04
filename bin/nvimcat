@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# nvimcat — dump a file as ANSI using your full Neovim config (plugins, themes, …).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export NVIM_ANSI_PAGER=1
+export NVIM_ANSI_PAGER_ROOT="$ROOT"
+export NVIMCAT_WIDTH="${NVIMCAT_WIDTH:-${COLUMNS:-80}}"
+
+if ! command -v nvim >/dev/null 2>&1; then
+  echo "nvimcat: nvim not found on PATH" >&2
+  exit 127
+fi
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: nvimcat <file>..." >&2
+  exit 2
+fi
+
+# Resolve paths now; do NOT pass files as nvim argv.
+# Argv files are opened before -c runs, which fires BufReadPost and starts
+# Copilot (and similar) auth before we can disable them.
+files=()
+for f in "$@"; do
+  if [[ -e "$f" ]]; then
+    files+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")")
+  else
+    files+=("$f")
+  fi
+done
+# RS-separated list (avoid NUL — bash warns in $(...)).
+export NVIMCAT_FILES="$(printf '%s\x1e' "${files[@]}")"
+
+# LazyVim rebuilds rtp during startup, so we prepend again in -c before require.
+ROOT_VIM="${ROOT//\\/\\\\}"
+ROOT_VIM="${ROOT_VIM//\'/\\\'}"
+
+exec nvim --headless \
+  --cmd "let g:nvim_ansi_pager = 1" \
+  --cmd "let g:nvim_ansi_pager_root = '${ROOT_VIM}'" \
+  --cmd "let g:copilot_enabled = v:false" \
+  --cmd "set rtp^=${ROOT}" \
+  -c "lua vim.opt.rtp:prepend(vim.env.NVIM_ANSI_PAGER_ROOT or vim.g.nvim_ansi_pager_root)" \
+  -c "lua require('nvim-ansi-pager').cli()"
