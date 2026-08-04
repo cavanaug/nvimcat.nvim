@@ -291,17 +291,6 @@ local function settle(buf, win, opts, need_mermaid)
   return is_ready(buf, need_mermaid)
 end
 
-local function hex_from_attr(attr, what)
-  local v = vim.fn.synIDattr(attr, what == "fg" and "fg#" or "bg#")
-  if v == "" or v == -1 or v == "-1" then
-    return nil
-  end
-  if type(v) == "number" then
-    return string.format("#%06x", v)
-  end
-  return v
-end
-
 local function ansi_color(hex, kind)
   if not hex or not hex:match("^#%x%x%x%x%x%x$") then
     return ""
@@ -315,35 +304,309 @@ local function ansi_color(hex, kind)
   return string.format("\27[48;2;%d;%d;%dm", r, g, b)
 end
 
---- screenattr misses hl_eol extmark backgrounds (e.g. RenderMarkdownH1Bg).
----@param win integer
----@return table<integer, string> screen_row -> #rrggbb
-local function extmark_screen_bgs(win)
-  local bgs = {}
-  local buf = vim.api.nvim_win_get_buf(win)
-  local function hl_bg(name)
-    if not name then
-      return nil
-    end
-    local h = vim.api.nvim_get_hl(0, { name = name, link = false })
-    if h.bg then
-      return string.format("#%06x", h.bg)
-    end
-    return nil
+---@param name string|string[]|nil
+---@param into table
+local function merge_hl(name, into)
+  if not name then
+    return
   end
-  for _, id in pairs(vim.api.nvim_get_namespaces()) do
-    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, id, 0, -1, { details = true })) do
-      local d = m[4] or {}
-      local bg = hl_bg(d.hl_group) or hl_bg(d.line_hl_group)
-      if bg then
-        local spos = vim.fn.screenpos(win, m[2] + 1, math.max(1, m[3] + 1))
-        if spos.row and spos.row > 0 then
-          bgs[spos.row] = bg
+  if type(name) == "table" then
+    for _, n in ipairs(name) do
+      merge_hl(n, into)
+    end
+    return
+  end
+  local h = vim.api.nvim_get_hl(0, { name = name, link = false })
+  if h.fg then
+    into.fg = string.format("#%06x", h.fg)
+  end
+  if h.bg then
+    into.bg = string.format("#%06x", h.bg)
+  end
+  if h.bold then
+    into.bold = true
+  end
+  if h.italic then
+    into.italic = true
+  end
+  if h.underline then
+    into.underline = true
+  end
+end
+
+--- Build per-cell styles from extmarks + treesitter.
+--- Headless screenattr misses extmark composition; screenpos() is wrong for
+--- concealed/virt_lines rows (e.g. mermaid), so all mapping is screen-text find.
+---@param win integer
+---@param rows integer
+---@param cols integer
+---@return table<integer, table<integer, table>>
+local function build_style_grid(win, rows, cols)
+  local grid = {}
+  local function cell(r, c)
+    grid[r] = grid[r] or {}
+    grid[r][c] = grid[r][c] or {}
+    return grid[r][c]
+  end
+
+  local buf = vim.api.nvim_win_get_buf(win)
+  local normal = {}
+  merge_hl("Normal", normal)
+
+  -- Per screen row: assembled text (non-empty cells) + byte→col map.
+  local assembled = {}
+  local byte_to_col = {}
+  for r = 1, rows do
+    local s = ""
+    local map = {}
+    for c = 1, cols do
+      local ch = vim.fn.screenstring(r, c)
+      if ch ~= "" then
+        local b0 = #s
+        s = s .. ch
+        for b = b0 + 1, #s do
+          map[b] = c
+        end
+      end
+    end
+    assembled[r] = s
+    byte_to_col[r] = map
+  end
+
+  ---@param text string
+  ---@param apply fun(dest: table)
+  ---@param opts? { all_cols?: boolean, allow_virt?: boolean, row?: integer, all_matches?: boolean }
+  local function paint_text(text, apply, opts)
+    opts = opts or {}
+    if not text or text == "" or text:find("\n", 1, true) then
+      return
+    end
+    local row_from, row_to = 1, rows
+    if opts.row then
+      row_from, row_to = opts.row, opts.row
+    end
+    local found_row
+    for r = row_from, row_to do
+      local search_from = 1
+      while true do
+        local start = assembled[r]:find(text, search_from, true)
+        if not start then
+          break
+        end
+        local map = byte_to_col[r]
+        local c0 = map[start]
+        local c1 = map[start + #text - 1]
+        if c0 and c1 then
+          if opts.all_cols then
+            c0, c1 = 1, cols
+          end
+          for c = c0, c1 do
+            local dest = cell(r, c)
+            if opts.allow_virt or not dest._virt then
+              apply(dest)
+            end
+          end
+          found_row = r
+          if not opts.all_matches then
+            return r
+          end
+        end
+        search_from = start + 1
+      end
+    end
+    return found_row
+  end
+
+  local function row_for_buffer_line(br)
+    local bline = vim.api.nvim_buf_get_lines(buf, br, br + 1, false)[1] or ""
+    local hint = bline:gsub("^#+%s*", ""):gsub("^>%s*", ""):match("[%w][%w%-%_ ][%w%-%_ ]+")
+    if hint then
+      hint = hint:gsub("%s+$", "")
+      for r = 1, rows do
+        if assembled[r]:find(hint, 1, true) then
+          return r
         end
       end
     end
   end
-  return bgs
+
+  local marks = {}
+  for _, id in pairs(vim.api.nvim_get_namespaces()) do
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, id, 0, -1, { details = true })) do
+      marks[#marks + 1] = m
+    end
+  end
+
+  -- Heading line backgrounds: locate by buffer heading text, not screenpos.
+  for _, m in ipairs(marks) do
+    local d = m[4] or {}
+    local hl = d.hl_group or d.line_hl_group
+    if hl and d.hl_eol and type(hl) == "string" and hl:find("RenderMarkdownH%d+Bg") then
+      local style = {}
+      merge_hl(hl, style)
+      local blines = vim.api.nvim_buf_get_lines(buf, m[2], m[2] + 1, false)
+      local text = (blines[1] or ""):gsub("^#+%s*", "")
+      if text ~= "" then
+        paint_text(text, function(dest)
+          for k, v in pairs(style) do
+            dest[k] = v
+          end
+        end, { all_cols = true, allow_virt = true })
+      end
+    end
+  end
+
+  -- Virt text (icons, table rules, quote marker): find chunk text on screen.
+  local punct = {}
+  merge_hl("@punctuation.special.markdown", punct)
+  for _, m in ipairs(marks) do
+    local d = m[4] or {}
+    if d.virt_text then
+      local row_hint = row_for_buffer_line(m[2])
+      for _, chunk in ipairs(d.virt_text) do
+        local text = chunk[1] or ""
+        -- Skip fillers: padding spaces, bg-as-fg bar runs.
+        if text:find("%S") and not text:find("█") then
+          local style = {}
+          merge_hl(chunk[2], style)
+          local short = vim.fn.strchars(text) <= 2
+          local row = paint_text(text, function(dest)
+            for k, v in pairs(style) do
+              dest[k] = v
+            end
+            dest._virt = true
+          end, {
+            allow_virt = true,
+            row = short and row_hint or nil,
+            all_matches = short and row_hint ~= nil,
+          })
+          -- Quote marker replaces '>'; TUI keeps the following space as
+          -- @punctuation.special (yellow) from the concealed '> '.
+          if row and text:find("▋") and punct.fg then
+            local map = byte_to_col[row]
+            local start = assembled[row]:find(text, 1, true)
+            if start then
+              local c = map[start + #text - 1]
+              if c then
+                local dest = cell(row, c + 1)
+                dest.fg = punct.fg
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- Treesitter markup: content text → screen (screenpos unusable with conceal).
+  pcall(function()
+    local parser = vim.treesitter.get_parser(buf)
+    if not parser then
+      return
+    end
+    parser:parse()
+    parser:for_each_tree(function(tree, ltree)
+      local lang = ltree:lang()
+      local q = vim.treesitter.query.get(lang, "highlights")
+      if not q then
+        return
+      end
+      for id, node in q:iter_captures(tree:root(), buf, 0, -1) do
+        local name = q.captures[id] or ""
+        local raw = vim.treesitter.get_node_text(node, buf)
+        if name:match("heading%.%d") then
+          local text = raw:gsub("^#+%s*", ""):gsub("\n.*", "")
+          local level = name:match("heading%.(%d)")
+          local fg_style = {}
+          if level then
+            merge_hl("RenderMarkdownH" .. level, fg_style)
+          end
+          paint_text(text, function(dest)
+            dest.bold = true
+            if fg_style.fg and not dest.fg then
+              dest.fg = fg_style.fg
+            end
+          end)
+        elseif name == "markup.heading" or name:match("heading$") then
+          -- Pipe-table header cells share capture name with ATX; not heading.N.
+          -- Keep trailing space from capture ("Tool ") — matches TUI cell padding.
+          local text = raw:gsub("\n.*", "")
+          if not text:find("%S") then
+            text = nil
+          end
+          local style = {}
+          merge_hl("RenderMarkdownTableHead", style)
+          paint_text(text, function(dest)
+            for k, v in pairs(style) do
+              dest[k] = v
+            end
+          end)
+        elseif name:find("strong", 1, true) then
+          local text = raw:gsub("^%*%*", ""):gsub("%*%*$", ""):gsub("^__", ""):gsub("__$", "")
+          paint_text(text, function(dest)
+            dest.bold = true
+            dest.fg = normal.fg
+            dest.bg = nil
+          end)
+        elseif name:find("italic", 1, true) or name:find("emphasis", 1, true) then
+          local text = raw:gsub("^[*_]", ""):gsub("[*_]$", "")
+          paint_text(text, function(dest)
+            dest.italic = true
+            dest.fg = normal.fg
+            dest.bg = nil
+          end)
+        elseif name == "markup.raw" or name == "code" then
+          local text = raw:gsub("^`", ""):gsub("`$", "")
+          local style = {}
+          merge_hl("@markup.raw.markdown_inline", style)
+          merge_hl("RenderMarkdownCodeInline", style)
+          paint_text(text, function(dest)
+            if style.fg then
+              dest.fg = style.fg
+            end
+            if style.bg then
+              dest.bg = style.bg
+            end
+          end)
+        elseif name:find("quote", 1, true) then
+          local text = raw:gsub("^>%s*", ""):gsub("\n.*", "")
+          local style = {}
+          merge_hl("RenderMarkdownQuote", style)
+          paint_text(text, function(dest)
+            if style.fg then
+              dest.fg = style.fg
+            end
+            dest.bg = normal.bg
+          end)
+        end
+      end
+    end)
+  end)
+
+  -- Mermaid diagram rows sit on RenderMarkdownCode bg in the TUI.
+  local code_bg = {}
+  merge_hl("RenderMarkdownCode", code_bg)
+  if code_bg.bg then
+    local lo, hi
+    for r = 1, rows do
+      if assembled[r]:find("◇", 1, true) then
+        lo = lo or r
+        hi = r
+      end
+    end
+    if lo and hi then
+      for r = lo, hi do
+        for c = 1, cols do
+          local dest = cell(r, c)
+          if not dest.bg then
+            dest.bg = code_bg.bg
+          end
+        end
+      end
+    end
+  end
+
+  return grid
 end
 
 local function capture_window()
@@ -351,29 +614,57 @@ local function capture_window()
   local rows = vim.o.lines
   local cols = vim.o.columns
   local win = vim.api.nvim_get_current_win()
-  local row_bgs = extmark_screen_bgs(win)
+  -- Match interactive chrome: no folds/statuscol ghosts in the grid.
+  pcall(function()
+    vim.wo[win].foldcolumn = "0"
+    vim.wo[win].statuscolumn = ""
+    vim.wo[win].signcolumn = "no"
+    vim.wo[win].number = false
+    vim.wo[win].relativenumber = false
+    vim.wo[win].list = false
+    vim.wo[win].cursorline = false
+  end)
+  vim.cmd("redraw!")
+  local styles = build_style_grid(win, rows, cols)
+  local normal = {}
+  merge_hl("Normal", normal)
   local out = {}
 
   for row = 1, rows do
     local plain = {}
     local ansi = {}
     local last = ""
-    local row_bg = row_bgs[row]
     for col = 1, cols do
       local ch = vim.fn.screenstring(row, col)
       if ch == "" then
         ch = " "
       end
       plain[#plain + 1] = ch
-      local attr = vim.fn.screenattr(row, col)
-      local fg = hex_from_attr(attr, "fg")
-      local bg = hex_from_attr(attr, "bg") or row_bg
-      local bold = vim.fn.synIDattr(attr, "bold") == "1"
-      local key = tostring(fg) .. "|" .. tostring(bg) .. "|" .. tostring(bold)
+      local st = styles[row] and styles[row][col]
+      -- ponytail: ignore screenattr — headless attr near virt_lines/conceal lies.
+      -- Default fg to Normal so unstyled text (mermaid boxes, prose) still matches TUI.
+      local fg = (st and st.fg) or normal.fg
+      local bg = st and st.bg or nil
+      local bold = st and st.bold or false
+      local italic = st and st.italic or false
+      local underline = st and st.underline or false
+      local key = table.concat({
+        tostring(fg),
+        tostring(bg),
+        bold and "b" or "",
+        italic and "i" or "",
+        underline and "u" or "",
+      }, "|")
       if key ~= last then
         ansi[#ansi + 1] = "\27[0m"
         if bold then
           ansi[#ansi + 1] = "\27[1m"
+        end
+        if italic then
+          ansi[#ansi + 1] = "\27[3m"
+        end
+        if underline then
+          ansi[#ansi + 1] = "\27[4m"
         end
         ansi[#ansi + 1] = ansi_color(fg, "fg")
         ansi[#ansi + 1] = ansi_color(bg, "bg")
@@ -386,7 +677,20 @@ local function capture_window()
     if p:match("^~+$") then
       break
     end
-    out[#out + 1] = table.concat(ansi):gsub("%s+\27%[0m$", "\27[0m")
+    local line = table.concat(ansi)
+    -- Keep trailing spaces when they carry a bg (RenderMarkdownH*Bg hl_eol bars).
+    local has_bg = false
+    for col = 1, cols do
+      local st = styles[row] and styles[row][col]
+      if st and st.bg then
+        has_bg = true
+        break
+      end
+    end
+    if not has_bg then
+      line = line:gsub("%s+\27%[0m$", "\27[0m")
+    end
+    out[#out + 1] = line
   end
 
   local function plain_of(line)
@@ -510,6 +814,60 @@ local function disable_side_effect_plugins(opts)
   end
 end
 
+local function silence_ui_noise()
+  pcall(vim.diagnostic.enable, false)
+  pcall(vim.diagnostic.hide)
+  -- Indent guides / scope lines (│) and cursor-word glow are not part of
+  -- the markdown render the user wants to dump.
+  pcall(function()
+    require("snacks").indent.disable()
+  end)
+  pcall(function()
+    require("ibl").update({ enabled = false })
+  end)
+  pcall(function()
+    vim.g.indent_blankline_enabled = false
+  end)
+  pcall(function()
+    vim.b.miniindentscope_disable = true
+  end)
+  pcall(function()
+    require("illuminate").pause()
+  end)
+  pcall(vim.cmd, "silent! IlluminatePauseBuf")
+  pcall(vim.cmd, "NoMatchParen")
+  pcall(vim.cmd, "silent! TSContextDisable")
+  pcall(vim.cmd, "nohlsearch")
+  vim.v.hlsearch = false
+  pcall(vim.fn.clearmatches)
+  pcall(function()
+    vim.fn.setreg("/", "")
+  end)
+  -- Headless can still paint CurSearch/IncSearch onto spans; neutralize for dump.
+  pcall(vim.api.nvim_set_hl, 0, "CurSearch", { link = "Normal" })
+  pcall(vim.api.nvim_set_hl, 0, "IncSearch", { link = "Normal" })
+  pcall(vim.api.nvim_set_hl, 0, "Search", { link = "Normal" })
+  pcall(function()
+    local state = require("render-markdown.state")
+    if state.config and state.config.indent then
+      state.config.indent.enabled = false
+    end
+    for _, cfg in pairs(state.cache or {}) do
+      if cfg.indent then
+        cfg.indent.enabled = false
+      end
+    end
+  end)
+  -- disable() alone can leave existing decoration marks; clear them.
+  local buf = vim.api.nvim_get_current_buf()
+  for name, id in pairs(vim.api.nvim_get_namespaces()) do
+    local n = tostring(name):lower()
+    if n:find("indent", 1, true) or n:find("illumin", 1, true) or n:find("cursorword", 1, true) then
+      pcall(vim.api.nvim_buf_clear_namespace, buf, id, 0, -1)
+    end
+  end
+end
+
 local function prepare_chrome(opts)
   vim.o.termguicolors = true
   vim.o.cmdheight = 0
@@ -524,8 +882,8 @@ local function prepare_chrome(opts)
   vim.o.foldcolumn = "0"
   vim.o.columns = opts.width
   vim.opt.fillchars:append({ eob = "~" })
-  pcall(vim.diagnostic.enable, false)
   disable_side_effect_plugins(opts)
+  silence_ui_noise()
 end
 
 --- Dump current buffer (or open `file`) to ANSI string.
@@ -591,10 +949,13 @@ function M.dump(opts)
 
   -- Park cursor off content and re-render so anti-conceal / cursorline
   -- variants match the "cursor not on this line" look.
+  silence_ui_noise()
   disable_anti_conceal()
+  -- Cursor off the content (anti-conceal), but keep topline at 1 so we
+  -- capture the start of the file, not whatever the cursor scrolled to.
   pcall(function()
     local last = vim.api.nvim_buf_line_count(buf)
-    vim.api.nvim_win_set_cursor(win, { last, 0 })
+    vim.fn.winrestview({ lnum = last, col = 0, topline = 1, leftcol = 0 })
   end)
   try_force_render(buf, win)
   vim.wait(80, function()
