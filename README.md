@@ -1,4 +1,4 @@
-# nvim-ansi-pager
+# nvimcat.nvim
 
 **CLI: `nvimcat`** · **Neovim: `:NvimCat`**
 
@@ -16,7 +16,7 @@ Not glow. Not mdcat. Not a second markdown engine. Your nvim is the renderer.
 
 ```lua
 {
-  "cavanaug/nvim-ansi-pager", -- or { dir = "~/path/to/nvim-ansi-pager" }
+  "cavanaug/nvimcat.nvim", -- or { dir = "~/path/to/nvimcat.nvim" }
   cmd = "NvimCat",
   opts = {
     -- disable_plugins = { "copilot.lua", ... },
@@ -27,7 +27,7 @@ Not glow. Not mdcat. Not a second markdown engine. Your nvim is the renderer.
 Put `bin/nvimcat` on your PATH (symlink is fine):
 
 ```bash
-ln -sf /path/to/nvim-ansi-pager/bin/nvimcat ~/.local/bin/nvimcat
+ln -sf /path/to/nvimcat.nvim/bin/nvimcat ~/.local/bin/nvimcat
 ```
 
 The CLI also `rtp:prepend`s the repo, so it works even if Lazy hasn’t loaded the plugin yet.
@@ -53,7 +53,7 @@ Inside Neovim:
 
 ## How it works
 
-1. `nvimcat` starts `nvim --headless` with your normal config (`g:nvim_ansi_pager = 1`).
+1. `nvimcat` starts `nvim --headless` with your normal config (`g:nvimcat = 1`).
 2. Waits until Lazy is ready (`VeryLazy` / short poll — not a fixed multi-second sleep).
 3. Disables side-effect plugins (Copilot, etc.), opens the file via env (not argv).
 4. Sizes the window, waits for decorations (tables / mermaid virt_lines) to settle.
@@ -62,7 +62,7 @@ Inside Neovim:
 ## Config
 
 ```lua
-require("nvim-ansi-pager").setup({
+require("nvimcat").setup({
   width = 80,
   min_wait_ms = 80,
   settle_ms = 120,
@@ -81,7 +81,7 @@ require("nvim-ansi-pager").setup({
 
 - Color fidelity from `screenattr` is approximate; layout match is the priority.
 - Very large files hit a `max_lines` cap and fall back to scroll-stitching.
-- Configs that assume a real TUI may need a `g:nvim_ansi_pager` guard.
+- Configs that assume a real TUI may need a `g:nvimcat` guard.
 - Dump disables render-markdown `anti_conceal` and forces `fillchars.eob=~` for a clean capture.
 
 ## License

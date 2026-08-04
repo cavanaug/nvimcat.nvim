@@ -1,7 +1,7 @@
---- nvim-ansi-pager: dump a buffer as ANSI using the user's full Neovim config.
+--- nvimcat: dump a buffer as ANSI using the user's full Neovim config.
 local M = {}
 
----@class nap.Opts
+---@class nvimcat.Opts
 ---@field width? integer
 ---@field min_wait_ms? integer
 ---@field settle_ms? integer
@@ -34,7 +34,7 @@ local function merge(opts)
 end
 
 --- Plugin setup (Lazy `opts` / `require(...).setup`).
----@param opts? nap.Opts
+---@param opts? nvimcat.Opts
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", DEFAULTS, opts or {})
 end
@@ -108,7 +108,7 @@ local function try_force_render(buf, win)
     plugins_loaded = true
   end
   pcall(function()
-    require("render-markdown.core.ui").update(buf, win, "nvim-ansi-pager", true)
+    require("render-markdown.core.ui").update(buf, win, "nvimcat", true)
   end)
   pcall(function()
     require("render-markdown").set(true)
@@ -433,7 +433,7 @@ local function prepare_chrome(opts)
 end
 
 --- Dump current buffer (or open `file`) to ANSI string.
----@param opts? nap.Opts|{file?: string}
+---@param opts? nvimcat.Opts|{file?: string}
 ---@return string
 function M.dump(opts)
   opts = merge(opts)
@@ -542,7 +542,7 @@ function M.dump(opts)
 end
 
 --- Dump into a new scratch buffer (interactive `:NvimCat`).
----@param opts? nap.Opts|{file?: string}
+---@param opts? nvimcat.Opts|{file?: string}
 function M.dump_to_buffer(opts)
   local ansi = M.dump(opts)
   local plain = ansi:gsub("\27%[[0-9;]*m", "")
@@ -623,7 +623,7 @@ end
 
 --- CLI entry: dump files to stdout and quit.
 function M.cli()
-  local root = vim.env.NVIM_ANSI_PAGER_ROOT or vim.g.nvim_ansi_pager_root
+  local root = vim.env.NVIMCAT_ROOT or vim.g.nvimcat_root
   if root and root ~= "" then
     vim.opt.rtp:prepend(root)
   end

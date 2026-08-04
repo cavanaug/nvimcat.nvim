@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export NVIM_ANSI_PAGER=1
-export NVIM_ANSI_PAGER_ROOT="$ROOT"
+export NVIMCAT=1
+export NVIMCAT_ROOT="$ROOT"
 export NVIMCAT_WIDTH="${NVIMCAT_WIDTH:-${COLUMNS:-80}}"
 
 if ! command -v nvim >/dev/null 2>&1; then
@@ -36,9 +36,9 @@ ROOT_VIM="${ROOT//\\/\\\\}"
 ROOT_VIM="${ROOT_VIM//\'/\\\'}"
 
 exec nvim --headless \
-  --cmd "let g:nvim_ansi_pager = 1" \
-  --cmd "let g:nvim_ansi_pager_root = '${ROOT_VIM}'" \
+  --cmd "let g:nvimcat = 1" \
+  --cmd "let g:nvimcat_root = '${ROOT_VIM}'" \
   --cmd "let g:copilot_enabled = v:false" \
   --cmd "set rtp^=${ROOT}" \
-  -c "lua vim.opt.rtp:prepend(vim.env.NVIM_ANSI_PAGER_ROOT or vim.g.nvim_ansi_pager_root)" \
-  -c "lua require('nvim-ansi-pager').cli()"
+  -c "lua vim.opt.rtp:prepend(vim.env.NVIMCAT_ROOT or vim.g.nvimcat_root)" \
+  -c "lua require('nvimcat').cli()"
