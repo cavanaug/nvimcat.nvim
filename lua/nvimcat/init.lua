@@ -437,16 +437,20 @@ local function build_style_grid(win, rows, cols)
     end
   end
 
-  -- Heading line backgrounds: locate by buffer heading text, not screenpos.
+  -- Full-line backgrounds from render-markdown (headings + fenced code).
+  -- Locate by buffer text on screen — screenpos() is wrong near virt_lines.
   for _, m in ipairs(marks) do
     local d = m[4] or {}
     local hl = d.hl_group or d.line_hl_group
-    if hl and d.hl_eol and type(hl) == "string" and hl:find("RenderMarkdownH%d+Bg") then
+    if hl and d.hl_eol and type(hl) == "string" then
       local style = {}
       merge_hl(hl, style)
       local blines = vim.api.nvim_buf_get_lines(buf, m[2], m[2] + 1, false)
-      local text = (blines[1] or ""):gsub("^#+%s*", "")
-      if text ~= "" then
+      local text = blines[1] or ""
+      if hl:find("RenderMarkdownH%d+Bg") then
+        text = text:gsub("^#+%s*", "")
+      end
+      if text:find("%S") then
         paint_text(text, function(dest)
           for k, v in pairs(style) do
             dest[k] = v
@@ -456,49 +460,7 @@ local function build_style_grid(win, rows, cols)
     end
   end
 
-  -- Virt text (icons, table rules, quote marker): find chunk text on screen.
-  local punct = {}
-  merge_hl("@punctuation.special.markdown", punct)
-  for _, m in ipairs(marks) do
-    local d = m[4] or {}
-    if d.virt_text then
-      local row_hint = row_for_buffer_line(m[2])
-      for _, chunk in ipairs(d.virt_text) do
-        local text = chunk[1] or ""
-        -- Skip fillers: padding spaces, bg-as-fg bar runs.
-        if text:find("%S") and not text:find("█") then
-          local style = {}
-          merge_hl(chunk[2], style)
-          local short = vim.fn.strchars(text) <= 2
-          local row = paint_text(text, function(dest)
-            for k, v in pairs(style) do
-              dest[k] = v
-            end
-            dest._virt = true
-          end, {
-            allow_virt = true,
-            row = short and row_hint or nil,
-            all_matches = short and row_hint ~= nil,
-          })
-          -- Quote marker replaces '>'; TUI keeps the following space as
-          -- @punctuation.special (yellow) from the concealed '> '.
-          if row and text:find("▋") and punct.fg then
-            local map = byte_to_col[row]
-            local start = assembled[row]:find(text, 1, true)
-            if start then
-              local c = map[start + #text - 1]
-              if c then
-                local dest = cell(row, c + 1)
-                dest.fg = punct.fg
-              end
-            end
-          end
-        end
-      end
-    end
-  end
-
-  -- Treesitter markup: content text → screen (screenpos unusable with conceal).
+  -- Treesitter: markdown markup + injected languages (e.g. rust in ```rust).
   pcall(function()
     local parser = vim.treesitter.get_parser(buf)
     if not parser then
@@ -511,9 +473,40 @@ local function build_style_grid(win, rows, cols)
       if not q then
         return
       end
+      local is_md = lang == "markdown" or lang == "markdown_inline"
       for id, node in q:iter_captures(tree:root(), buf, 0, -1) do
         local name = q.captures[id] or ""
+        if name:sub(1, 1) == "_" then
+          goto continue
+        end
         local raw = vim.treesitter.get_node_text(node, buf)
+        if not is_md then
+          -- Injected code: paint @capture colors onto visible text.
+          if raw and #raw > 0 and #raw < 160 and not raw:find("\n", 1, true) then
+            local style = {}
+            merge_hl("@" .. name .. "." .. lang, style)
+            if not style.fg and not style.bold and not style.italic then
+              merge_hl("@" .. name, style)
+            end
+            if style.fg or style.bold or style.italic or style.underline then
+              paint_text(raw, function(dest)
+                if style.fg then
+                  dest.fg = style.fg
+                end
+                if style.bold then
+                  dest.bold = true
+                end
+                if style.italic then
+                  dest.italic = true
+                end
+                if style.underline then
+                  dest.underline = true
+                end
+              end)
+            end
+          end
+          goto continue
+        end
         if name:match("heading%.%d") then
           local text = raw:gsub("^#+%s*", ""):gsub("\n.*", "")
           local level = name:match("heading%.(%d)")
@@ -579,9 +572,69 @@ local function build_style_grid(win, rows, cols)
             dest.bg = normal.bg
           end)
         end
+        ::continue::
       end
     end)
   end)
+
+  -- Virt text last (icons, table rules, language bars with █ fill).
+  local punct = {}
+  merge_hl("@punctuation.special.markdown", punct)
+  for _, m in ipairs(marks) do
+    local d = m[4] or {}
+    if d.virt_text then
+      local row_hint = row_for_buffer_line(m[2])
+      for _, chunk in ipairs(d.virt_text) do
+        local text = chunk[1] or ""
+        if text:find("%S") or text:find("█") then
+          local style = {}
+          merge_hl(chunk[2], style)
+          if text:find("█") then
+            -- Language/code border filler: color every on-screen █ (full width).
+            if not style.bg then
+              style.bg = normal.bg
+            end
+            for r = 1, rows do
+              for c = 1, cols do
+                if vim.fn.screenstring(r, c) == "█" then
+                  local dest = cell(r, c)
+                  for k, v in pairs(style) do
+                    dest[k] = v
+                  end
+                  dest._virt = true
+                end
+              end
+            end
+          else
+            local short = vim.fn.strchars(text) <= 2
+            local row = paint_text(text, function(dest)
+              for k, v in pairs(style) do
+                dest[k] = v
+              end
+              dest._virt = true
+            end, {
+              allow_virt = true,
+              row = short and row_hint or nil,
+              all_matches = short and row_hint ~= nil,
+            })
+            -- Quote marker replaces '>'; TUI keeps the following space as
+            -- @punctuation.special (yellow) from the concealed '> '.
+            if row and text:find("▋") and punct.fg then
+              local map = byte_to_col[row]
+              local start = assembled[row]:find(text, 1, true)
+              if start then
+                local c = map[start + #text - 1]
+                if c then
+                  local dest = cell(row, c + 1)
+                  dest.fg = punct.fg
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
 
   -- Mermaid diagram rows sit on RenderMarkdownCode bg in the TUI.
   local code_bg = {}

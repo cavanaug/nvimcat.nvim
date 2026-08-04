@@ -15,4 +15,8 @@ flowchart LR
   B -->|yes| C[Done]
 ```
 
+```rust
+fn main() {}
+```
+
 > a quote

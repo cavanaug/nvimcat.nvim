@@ -30,6 +30,8 @@ first_ansi = next((l for l in raw.splitlines() if "Heading One" in re.sub(r"\x1b
 para = next((l for l in raw.splitlines() if "bold" in re.sub(r"\x1b\[[0-9;]*m", "", l)), "")
 table = next((l for l in raw.splitlines() if "Tool" in re.sub(r"\x1b\[[0-9;]*m", "", l)), "")
 quote = next((l for l in raw.splitlines() if "quote" in re.sub(r"\x1b\[[0-9;]*m", "", l)), "")
+lang = next((l for l in raw.splitlines() if "rust" in re.sub(r"\x1b\[[0-9;]*m", "", l) and "█" in l), "")
+fn_line = next((l for l in raw.splitlines() if "fn main" in re.sub(r"\x1b\[[0-9;]*m", "", l)), "")
 
 def styles_for(line):
     fg = bg = None
@@ -94,6 +96,8 @@ checks = {
     "para_code": word_ok(para, "code", want_b=False, want_fg="#e7c664"),
     "table_head_fg": word_ok(table, "Tool", want_b=True, want_fg="#fc5d7c"),
     "quote_fg": word_ok(quote, "quote", want_fg="#7f8490"),
+    "code_lang_bar": bool(lang) and "48;2;" in lang,
+    "code_fn_syntax": word_ok(fn_line, "fn", want_fg="#fc5d7c"),
     "mermaid_diagram": ("Start" in plain and "Done" in plain and "┌" in plain),
     "no_eob_pad": "quote" in (plain.splitlines()[-1] if plain.splitlines() else ""),
     # cold LazyVim dump target from design (~2s); allow slack on busy hosts
