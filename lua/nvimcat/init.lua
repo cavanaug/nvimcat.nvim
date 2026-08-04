@@ -498,6 +498,12 @@ function M.dump(opts)
     )
   end
 
+  local function estimate_height(b)
+    local lines = vim.api.nvim_buf_line_count(b)
+    return math.max(24, math.min(200, lines + 32))
+  end
+  vim.g.nvimcat_rows = estimate_height(buf)
+
   -- Signal embed client: next UI flush is the frame to emit.
   vim.g.nvimcat_capture = 1
   vim.cmd("redraw!")
@@ -637,7 +643,9 @@ function M.cli()
       vim.cmd("cquit 1")
       return
     end
-    vim.cmd("qa!")
+    if vim.env.NVIMCAT_EMBED ~= "1" then
+      vim.cmd("qa!")
+    end
   end)
 end
 
