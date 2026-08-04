@@ -254,20 +254,33 @@ local function is_ready(buf, need_mermaid)
   return has_rm_marks(buf) or has_table_decor(buf)
 end
 
+local function render_generation(buf)
+  local ok, decorator = pcall(function()
+    return require("render-markdown.core.ui").get(buf)
+  end)
+  return ok and decorator and decorator.n or nil
+end
+
 local function settle(buf, win, opts, need_mermaid)
   -- Force once, then only poll. Re-forcing every tick (debounce=0) schedules
   -- unbounded ui.update callbacks and can prevent decorations from stabilizing.
+  local before = render_generation(buf)
   if not is_ready(buf, need_mermaid) then
     try_force_render(buf, win, need_mermaid)
   end
   local ok = vim.wait(opts.timeout_ms, function()
+    local generation = render_generation(buf)
     return is_ready(buf, need_mermaid)
+      and (before == nil or (generation ~= nil and generation > before))
   end, 20)
   if not ok then
     -- One last nudge, then brief wait — still no per-tick thrash.
+    before = render_generation(buf)
     try_force_render(buf, win, need_mermaid)
     vim.wait(math.min(500, opts.timeout_ms), function()
+      local generation = render_generation(buf)
       return is_ready(buf, need_mermaid)
+        and (before == nil or (generation ~= nil and generation > before))
     end, 20)
   end
   if not is_ready(buf, need_mermaid) then
@@ -498,6 +511,15 @@ function M.dump(opts)
   pcall(function()
     vim.fn.winrestview({ lnum = 1, col = 0, topline = 1, leftcol = 0 })
   end)
+  -- winrestview changes the visible range after settle; refresh decorations
+  -- for the restored first page before the capture client snapshots the grid.
+  local before_view_render = render_generation(buf)
+  try_force_render(buf, win, need_mermaid)
+  vim.wait(math.min(500, opts.timeout_ms), function()
+    local generation = render_generation(buf)
+    return before_view_render == nil
+      or (generation ~= nil and generation > before_view_render)
+  end, 20)
   -- Re-assert chrome: LazyVim/lualine may flip laststatus back on.
   vim.o.laststatus = 0
   vim.o.showtabline = 0

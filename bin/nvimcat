@@ -835,19 +835,14 @@ local top = {int(next_top)}
 local win = vim.api.nvim_get_current_win()
 local buf = vim.api.nvim_get_current_buf()
 vim.fn.winrestview({{ lnum = top, col = 0, topline = top, leftcol = 0 }})
+local decorator = require("render-markdown.core.ui").get(buf)
+local before = decorator.n
 pcall(function()
   require("render-markdown.core.ui").update(buf, win, "nvimcat-page", true)
 end)
--- Let scheduled ui.update run before we snapshot the grid.
+-- Wait for this page's parse, not stale extmarks from the previous page.
 vim.wait(200, function()
-  for name, id in pairs(vim.api.nvim_get_namespaces()) do
-    if name:find("render%-markdown", 1, false) then
-      if #vim.api.nvim_buf_get_extmarks(buf, id, 0, -1, {{}}) > 0 then
-        return true
-      end
-    end
-  end
-  return false
+  return decorator.n > before
 end, 10)
 vim.cmd("redraw!")
 """,
