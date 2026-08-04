@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Neovim --embed UI client (msgpack-rpc over stdio)."""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import threading
+import time
+from typing import Any, Callable
+
+_BIN = os.path.dirname(os.path.abspath(__file__))
+if _BIN not in sys.path:
+    sys.path.insert(0, _BIN)
+
+import nvimcat_msgpack as mp  # noqa: E402
+from nvimcat_grid import Grid  # noqa: E402
+
+
+class NvimEmbed:
+    def __init__(
+        self,
+        argv: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        on_notify: Callable[[str, list[Any]], None] | None = None,
+    ) -> None:
+        self._on_notify = on_notify or (lambda _m, _a: None)
+        self._unpacker = mp.Unpacker()
+        self._next_id = 1
+        self._pending: dict[int, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._proc = subprocess.Popen(
+            argv or ["nvim", "--embed", "--clean", "-n", "--headless"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            bufsize=0,
+        )
+        assert self._proc.stdin and self._proc.stdout
+        self._stdin = self._proc.stdin
+        self._stdout_fd = self._proc.stdout.fileno()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def _read_loop(self) -> None:
+        assert self._proc.stdout
+        while True:
+            chunk = self._proc.stdout.read(1 << 16)
+            if not chunk:
+                break
+            self._unpacker.feed(chunk)
+            while True:
+                try:
+                    msg = self._unpacker.unpack()
+                except mp.NeedMoreData:
+                    break
+                self._dispatch(msg)
+
+    def _dispatch(self, msg: Any) -> None:
+        if not isinstance(msg, list) or not msg:
+            return
+        kind = msg[0]
+        if kind == 1 and len(msg) >= 4:  # response
+            req_id = msg[1]
+            with self._lock:
+                slot = self._pending.pop(req_id, None)
+            if slot is not None:
+                slot["error"] = msg[2]
+                slot["result"] = msg[3]
+                slot["event"].set()
+        elif kind == 2 and len(msg) >= 3:  # notification
+            self._on_notify(msg[1], msg[2] if isinstance(msg[2], list) else [])
+        elif kind == 0 and len(msg) >= 4:  # request from nvim (e.g. "vimenter")
+            req_id = msg[1]
+            self._send([1, req_id, None, None])
+
+    def _send(self, obj: Any) -> None:
+        with self._send_lock:
+            self._stdin.write(mp.pack(obj))
+            self._stdin.flush()
+
+    def request(self, method: str, *args: Any, timeout: float | None = None) -> Any:
+        req_id = self._next_id
+        self._next_id += 1
+        ev = threading.Event()
+        slot = {"event": ev, "error": None, "result": None}
+        with self._lock:
+            self._pending[req_id] = slot
+        self._send([0, req_id, method, list(args)])
+        deadline = time.time() + (timeout if timeout is not None else 30)
+        while not ev.is_set():
+            if time.time() >= deadline:
+                raise TimeoutError(f"RPC timeout: {method}")
+            if self._proc.poll() is not None:
+                with self._lock:
+                    self._pending.pop(req_id, None)
+                if slot["error"] is not None:
+                    raise RuntimeError(slot["error"])
+                return slot["result"]
+            ev.wait(timeout=0.05)
+        if slot["error"] is not None:
+            raise RuntimeError(slot["error"])
+        return slot["result"]
+
+    def ui_attach(self, width: int, height: int, **options: Any) -> None:
+        opts = {"rgb": True, "ext_linegrid": True, **options}
+        self.request("nvim_ui_attach", width, height, opts)
+
+    def close(self) -> None:
+        try:
+            self._stdin.close()
+        except OSError:
+            pass
+        self._proc.wait(timeout=5)
+
+
+def _estimate_rows(paths: list[str]) -> int:
+    total = 0
+    for path in paths:
+        try:
+            with open(path, "rb") as fh:
+                total += sum(1 for _ in fh)
+        except OSError:
+            total += 40
+    if not paths:
+        total = 40
+    return max(24, min(200, total + 32))
+
+
+def _nvim_argv(root: str) -> list[str]:
+    root_esc = root.replace("\\", "\\\\").replace("'", "\\'")
+    return [
+        "nvim",
+        "--embed",
+        "-n",
+        "--cmd",
+        "let g:nvimcat = 1",
+        "--cmd",
+        f"let g:nvimcat_root = '{root_esc}'",
+        "--cmd",
+        "let g:copilot_enabled = v:false",
+        "--cmd",
+        f"set rtp^={root}",
+    ]
+
+
+def _apply_redraw(grid: Grid, events: list[Any]) -> bool:
+    flushed = False
+    for ev in events:
+        if not ev:
+            continue
+        name = ev[0]
+        if name == "flush":
+            flushed = True
+            continue
+        for item in ev[1:]:
+            if name == "grid_resize" and isinstance(item, list) and len(item) >= 3:
+                grid.apply_grid_resize(int(item[0]), int(item[1]), int(item[2]))
+            elif name == "grid_line" and isinstance(item, list) and len(item) >= 5:
+                grid.apply_grid_line(
+                    int(item[0]), int(item[1]), int(item[2]), item[3], bool(item[4])
+                )
+            elif name == "grid_clear" and isinstance(item, list) and item:
+                grid.apply_grid_clear(int(item[0]))
+            elif name == "grid_destroy" and isinstance(item, list) and item:
+                grid.apply_grid_destroy(int(item[0]))
+            elif name == "hl_attr_define" and isinstance(item, list) and len(item) >= 4:
+                grid.apply_hl_attr_define(int(item[0]), item[1], item[2], item[3])
+    return flushed
+
+
+def capture(width: int, files: list[str]) -> int:
+    root = os.environ.get("NVIMCAT_ROOT") or os.path.dirname(_BIN)
+    height = _estimate_rows(files)
+    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "30"))
+
+    env = os.environ.copy()
+    env["NVIMCAT"] = "1"
+    env["NVIMCAT_ROOT"] = root
+    env["NVIMCAT_WIDTH"] = str(width)
+    env["NVIMCAT_EMBED"] = "1"
+    env["NVIMCAT_FILES"] = "\x1e".join(files) + ("\x1e" if files else "")
+
+    grid = Grid()
+    grid_lock = threading.Lock()
+    flush_ev = threading.Event()
+    awaiting_resize_flush = False
+    output_parts: list[bytes] = []
+
+    def on_notify(method: str, args: list[Any]) -> None:
+        if method != "redraw":
+            return
+        with grid_lock:
+            flushed = _apply_redraw(grid, args)
+        if flushed:
+            flush_ev.set()
+
+    nv = NvimEmbed(argv=_nvim_argv(root), env=env, on_notify=on_notify)
+    deadline = time.time() + timeout
+    rc = 1
+    try:
+        nv.ui_attach(width, height)
+        nv.request("nvim_command", f"luafile {root}/scripts/cli-entry.lua")
+
+        while time.time() < deadline:
+            if nv._proc.poll() is not None:
+                print("nvimcat-embed: nvim exited early", file=sys.stderr)
+                break
+
+            remaining = max(0.0, deadline - time.time())
+            wait = min(0.1, remaining)
+            if not flush_ev.wait(timeout=wait):
+                continue
+            flush_ev.clear()
+
+            try:
+                done = nv.request("nvim_get_var", "nvimcat_done", timeout=remaining)
+            except (TimeoutError, RuntimeError):
+                done = 0
+            if done == 1:
+                sys.stdout.buffer.write(b"".join(output_parts))
+                sys.stdout.buffer.flush()
+                try:
+                    nv.request("nvim_command", "qa!", timeout=5)
+                except (TimeoutError, RuntimeError):
+                    pass
+                rc = 0
+                break
+
+            try:
+                cap = nv.request("nvim_get_var", "nvimcat_capture", timeout=remaining)
+            except (TimeoutError, RuntimeError):
+                continue
+            if cap != 1:
+                continue
+
+            if not awaiting_resize_flush:
+                try:
+                    rows = nv.request("nvim_get_var", "nvimcat_rows", timeout=remaining)
+                except (TimeoutError, RuntimeError):
+                    rows = None
+                if isinstance(rows, int) and rows > 0 and rows != height:
+                    nv.request("nvim_ui_try_resize", width, rows, timeout=remaining)
+                    height = rows
+                    nv.request("nvim_command", "redraw!", timeout=remaining)
+                    awaiting_resize_flush = True
+                    continue
+
+            with grid_lock:
+                part = grid.to_ansi()
+            if output_parts:
+                output_parts.append(b"\n")
+            output_parts.append(part)
+            awaiting_resize_flush = False
+            try:
+                nv.request("nvim_set_var", "nvimcat_capture", 0, timeout=remaining)
+            except (TimeoutError, RuntimeError):
+                pass
+        else:
+            print("nvimcat-embed: timed out waiting for capture", file=sys.stderr)
+    finally:
+        nv.close()
+    return rc
+
+
+def smoke(width: int) -> int:
+    nv = NvimEmbed()
+    try:
+        nv.ui_attach(width, 24)
+        nv.request("nvim_command", "qa!")
+    finally:
+        nv.close()
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--smoke":
+        return smoke(int(sys.argv[2]))
+    if len(sys.argv) < 3:
+        print("usage: nvimcat-embed WIDTH <file>...", file=sys.stderr)
+        print("       nvimcat-embed --smoke WIDTH", file=sys.stderr)
+        return 2
+    width = int(sys.argv[1])
+    files = sys.argv[2:]
+    return capture(width, files)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

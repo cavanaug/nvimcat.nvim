@@ -65,19 +65,17 @@ Inside Neovim:
 
 ## How it works
 
-1. `nvimcat` starts `nvim --headless` with your normal config (`g:nvimcat = 1`).
+1. `nvimcat` starts `nvim --embed` with your normal config (`g:nvimcat = 1`) and attaches a UI client.
 2. Waits until Lazy is ready (`VeryLazy` / short poll — not a fixed multi-second sleep).
 3. Disables side-effect plugins (Copilot, etc.), opens the file via env (not argv).
-4. Sizes the window, waits for decorations (tables / mermaid virt_lines) to settle.
-5. Captures the screen grid → ANSI on stdout, then quits.
+4. Sizes the window, waits until decorations are ready (tables / mermaid virt_lines).
+5. Emits the composed screen grid as ANSI on stdout, then quits.
 
 ## Config
 
 ```lua
 require("nvimcat").setup({
   width = 80,
-  min_wait_ms = 80,
-  settle_ms = 120,
   timeout_ms = 8000,
   disable_plugins = { "copilot.lua", "copilot-cmp", "blink-copilot" },
 })
@@ -86,15 +84,17 @@ require("nvimcat").setup({
 ## Requirements
 
 - Neovim 0.10+
+- Python 3 (stdlib only — embed UI client)
 - Your usual plugin setup for the filetypes you care about
 - A terminal/font that matches what you use inside nvim (Nerd Font icons, etc.)
 
 ## Limitations
 
-- Color fidelity from `screenattr` is approximate; layout match is the priority.
-- Very large files hit a `max_lines` cap and fall back to scroll-stitching.
-- Configs that assume a real TUI may need a `g:nvimcat` guard.
+- Composed-grid ANSI from the embed UI protocol; truecolor when the grid provides it.
+- Very large files hit a `max_lines` / height estimate; resize once after decorations settle.
+- Configs that assume a real TTY may need a `g:nvimcat` guard.
 - Dump disables render-markdown `anti_conceal` and forces `fillchars.eob=~` for a clean capture.
+- Legacy `bin/nvimcat-pty` + `bin/nvimcat-shot2ansi` remain for debugging; the default CLI is embed UI.
 
 ## License
 
