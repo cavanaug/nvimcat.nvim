@@ -499,15 +499,44 @@ function M.dump(opts)
   end
 
   local function estimate_height(b)
-    local lines = vim.api.nvim_buf_line_count(b)
-    return math.max(24, math.min(200, lines + 32))
+    local n = vim.api.nvim_buf_line_count(b)
+    local extra = 0
+    for _, id in pairs(vim.api.nvim_get_namespaces()) do
+      for _, m in ipairs(vim.api.nvim_buf_get_extmarks(b, id, 0, -1, { details = true })) do
+        local d = m[4] or {}
+        if d.virt_lines then
+          extra = extra + #d.virt_lines
+        end
+      end
+    end
+    if buffer_needs_mermaid(b) and extra < 8 then
+      extra = extra + 12
+    end
+    local cap = opts.max_lines or 5000
+    return math.max(24, math.min(cap, n + extra + math.floor(n * 0.15) + 8))
   end
   vim.g.nvimcat_rows = estimate_height(buf)
 
-  -- Signal embed client: next UI flush is the frame to emit.
-  vim.g.nvimcat_capture = 1
+  if vim.env.NVIMCAT_EMBED == "1" then
+    -- Embed client owns ANSI; next UI flush is the frame to emit.
+    vim.g.nvimcat_capture = 1
+    vim.cmd("redraw!")
+    return ""
+  end
+
+  -- Interactive TUI (:NvimCat): capture composed grid via screenshot.
+  vim.o.lines = math.min(opts.max_lines or 5000, math.max(vim.o.lines, vim.g.nvimcat_rows))
+  pcall(vim.api.nvim_win_set_height, win, math.max(1, vim.o.lines - 2))
   vim.cmd("redraw!")
-  return "" -- embed client owns ANSI; dump returns empty in CLI embed mode
+  local path = vim.fn.tempname() .. ".nvimcat.shot"
+  vim.api.nvim__screenshot(path)
+  local root = plugin_root() or "."
+  local ansi = vim.fn.system({ "python3", root .. "/bin/nvimcat-shot2ansi", path })
+  pcall(os.remove, path)
+  if vim.v.shell_error ~= 0 then
+    error("nvimcat: shot2ansi failed: " .. tostring(ansi))
+  end
+  return ansi
 end
 
 --- Dump into a new scratch buffer (interactive `:NvimCat`).
@@ -625,27 +654,24 @@ function M.cli()
       io.stderr:write("nvimcat: dumping…\n")
     end
     local ok, err = pcall(function()
-      local shot = vim.env.NVIMCAT_SHOT
-      if shot and shot ~= "" then
-        -- PTY CLI: one file per invocation; write raw TUI screenshot for the shell.
-        M.dump(vim.tbl_extend("force", opts, { file = files[1] }))
-      else
-        local embed = vim.env.NVIMCAT_EMBED == "1"
-        for i, file in ipairs(files) do
-          if not embed and i > 1 then
-            io.stdout:write("\n")
+      if vim.env.NVIMCAT_SHOT and vim.env.NVIMCAT_SHOT ~= "" then
+        error("nvimcat: NVIMCAT_SHOT/PTY path removed; use default embed CLI (bin/nvimcat)")
+      end
+      local embed = vim.env.NVIMCAT_EMBED == "1"
+      for i, file in ipairs(files) do
+        if not embed and i > 1 then
+          io.stdout:write("\n")
+        end
+        local dumped = M.dump(vim.tbl_extend("force", opts, { file = file }))
+        if embed then
+          local t0 = vim.uv.now()
+          while vim.g.nvimcat_capture == 1 and (vim.uv.now() - t0) < 30000 do
+            vim.wait(20, function()
+              return vim.g.nvimcat_capture ~= 1
+            end, 50)
           end
-          local dumped = M.dump(vim.tbl_extend("force", opts, { file = file }))
-          if embed then
-            local t0 = vim.uv.now()
-            while vim.g.nvimcat_capture == 1 and (vim.uv.now() - t0) < 30000 do
-              vim.wait(20, function()
-                return vim.g.nvimcat_capture ~= 1
-              end, 50)
-            end
-          else
-            io.stdout:write(dumped)
-          end
+        else
+          io.stdout:write(dumped)
         end
       end
     end)

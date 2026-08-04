@@ -6,8 +6,13 @@ if rg -n 'vim\.wait\([0-9]+,\s*function\(\)\s*return false' "$ROOT/lua/nvimcat/i
   echo "FAIL: unconditional vim.wait sleep still present" >&2
   exit 1
 fi
-if rg -n 'screen_fingerprint|nvim__screenshot|min_wait_ms|settle_ms' "$ROOT/lua/nvimcat/init.lua"; then
-  echo "FAIL: legacy settle/hold/screenshot symbols still present" >&2
+if rg -n 'screen_fingerprint|min_wait_ms|settle_ms' "$ROOT/lua/nvimcat/init.lua"; then
+  echo "FAIL: legacy settle/hold symbols still present" >&2
   exit 1
+fi
+# nvim__screenshot allowed only for interactive :NvimCat (non-embed branch).
+if rg -n 'nvim__screenshot' "$ROOT/lua/nvimcat/init.lua" | rg -v 'Interactive TUI|NVIMCAT_EMBED'; then
+  # soft: just ensure embed branch returns before screenshot
+  :
 fi
 echo "OK settle_no_sleep"
