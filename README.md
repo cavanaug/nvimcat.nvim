@@ -94,7 +94,7 @@ require("nvimcat").setup({
 - Very large files hit a `max_lines` / height estimate; resize once after decorations settle.
 - Configs that assume a real TTY may need a `g:nvimcat` guard.
 - Dump disables render-markdown `anti_conceal` and forces `fillchars.eob=~` for a clean capture.
-- Legacy `bin/nvimcat-pty` + `bin/nvimcat-shot2ansi` remain for debugging; the default CLI is embed UI.
+- CLI is a single `bin/nvimcat` (embed UI client). `:NvimCat` uses `nvimcat --shot2ansi`.
 
 ## License
 

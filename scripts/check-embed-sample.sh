@@ -2,9 +2,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$(mktemp)"
+trap 'rm -f "$OUT"' EXIT
 export NVIMCAT_ROOT="$ROOT" NVIMCAT_WIDTH=80 NVIMCAT_EMBED=1
 start="$(date +%s%3N)"
-python3 "$ROOT/bin/nvimcat-embed" 80 "$ROOT/fixtures/sample.md" >"$OUT"
+python3 "$ROOT/bin/nvimcat" 80 "$ROOT/fixtures/sample.md" >"$OUT"
 end="$(date +%s%3N)"
 elapsed=$((end - start))
 python3 - "$OUT" "$elapsed" <<'PY'

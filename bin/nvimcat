@@ -1,55 +1,989 @@
-#!/usr/bin/env bash
-# nvimcat — dump a file as ANSI using your full Neovim config (plugins, themes, …).
-# Uses nvim --embed + UI attach so output matches the real TUI cell grid.
-set -euo pipefail
+#!/usr/bin/env python3
+"""nvimcat — dump a file as ANSI using your full Neovim config.
 
-# Resolve symlinks so ~/.local/bin/nvimcat → plugin tree, not ~/.local.
-SOURCE="${BASH_SOURCE[0]}"
-while [[ -L "$SOURCE" ]]; do
-  TARGET="$(readlink "$SOURCE")"
-  if [[ "$TARGET" != /* ]]; then
-    SOURCE="$(cd "$(dirname "$SOURCE")" && pwd)/$TARGET"
-  else
-    SOURCE="$TARGET"
-  fi
-done
-ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
-export NVIMCAT=1
-export NVIMCAT_ROOT="$ROOT"
+Single binary: embed UI client (msgpack + grid + ANSI) and --shot2ansi for :NvimCat.
+"""
+from __future__ import annotations
 
-# Width: explicit NVIMCAT_WIDTH > controlling TTY > tput > COLUMNS > 80.
-if [[ -z "${NVIMCAT_WIDTH:-}" ]]; then
-  cols=""
-  cols="$(bash -c 'stty size < /dev/tty' 2>/dev/null | awk '{print $2}' || true)"
-  if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
-    cols="$(tput cols 2>/dev/null || true)"
-  fi
-  if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
-    cols="${COLUMNS:-}"
-  fi
-  if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
-    cols=80
-  fi
-  export NVIMCAT_WIDTH="$cols"
-fi
+import os
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable
 
-if ! command -v nvim >/dev/null 2>&1; then
-  echo "nvimcat: nvim not found on PATH" >&2
-  exit 127
-fi
+_ROOT = Path(__file__).resolve().parent.parent
 
-if [[ $# -lt 1 ]]; then
-  echo "usage: nvimcat <file>..." >&2
-  exit 2
-fi
+# --- msgpack ----------------------------------------------------------------
 
-files=()
-for f in "$@"; do
-  if [[ -e "$f" ]]; then
-    files+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")")
-  else
-    files+=("$f")
-  fi
-done
+class NeedMoreData(Exception):
+    pass
 
-exec python3 "$ROOT/bin/nvimcat-embed" "$NVIMCAT_WIDTH" "${files[@]}"
+
+def pack(obj: Any) -> bytes:
+    if obj is None:
+        return b"\xc0"
+    if obj is False:
+        return b"\xc2"
+    if obj is True:
+        return b"\xc3"
+    if isinstance(obj, int):
+        if 0 <= obj <= 127:
+            return bytes([obj])
+        if -32 <= obj < 0:
+            return bytes([obj & 0xFF])
+        if 0 <= obj <= 0xFF:
+            return b"\xcc" + bytes([obj])
+        if 0 <= obj <= 0xFFFF:
+            return b"\xcd" + struct.pack(">H", obj)
+        if 0 <= obj <= 0xFFFFFFFF:
+            return b"\xce" + struct.pack(">I", obj)
+        if -128 <= obj <= 127:
+            return b"\xd0" + struct.pack("b", obj)
+        if -32768 <= obj <= 32767:
+            return b"\xd1" + struct.pack(">h", obj)
+        if -2147483648 <= obj <= 2147483647:
+            return b"\xd2" + struct.pack(">i", obj)
+        return b"\xd3" + struct.pack(">q", obj)
+    if isinstance(obj, float):
+        return b"\xcb" + struct.pack(">d", obj)
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        b = bytes(obj)
+        ln = len(b)
+        if ln <= 0xFF:
+            return b"\xc4" + bytes([ln]) + b
+        if ln <= 0xFFFF:
+            return b"\xc5" + struct.pack(">H", ln) + b
+        return b"\xc6" + struct.pack(">I", ln) + b
+    if isinstance(obj, str):
+        b = obj.encode("utf-8")
+        ln = len(b)
+        if ln <= 31:
+            return bytes([0xA0 + ln]) + b
+        if ln <= 0xFF:
+            return b"\xd9" + bytes([ln]) + b
+        if ln <= 0xFFFF:
+            return b"\xda" + struct.pack(">H", ln) + b
+        return b"\xdb" + struct.pack(">I", ln) + b
+    if isinstance(obj, (list, tuple)):
+        n = len(obj)
+        if n <= 15:
+            out = bytes([0x90 + n])
+        elif n <= 0xFFFF:
+            out = b"\xdc" + struct.pack(">H", n)
+        else:
+            out = b"\xdd" + struct.pack(">I", n)
+        return out + b"".join(pack(x) for x in obj)
+    if isinstance(obj, dict):
+        n = len(obj)
+        if n <= 15:
+            out = bytes([0x80 + n])
+        elif n <= 0xFFFF:
+            out = b"\xde" + struct.pack(">H", n)
+        else:
+            out = b"\xdf" + struct.pack(">I", n)
+        for k, v in obj.items():
+            out += pack(k) + pack(v)
+        return out
+    if isinstance(obj, Ext):
+        return _pack_ext(obj.code, obj.data)
+    raise TypeError(f"cannot pack {type(obj)!r}")
+
+
+class Ext:
+    """Opaque msgpack extension (Neovim Buffer/Window/etc.)."""
+
+    __slots__ = ("code", "data")
+
+    def __init__(self, code: int, data: bytes) -> None:
+        self.code = code
+        self.data = data
+
+
+def _pack_ext(code: int, data: bytes) -> bytes:
+    ln = len(data)
+    if ln == 1:
+        return b"\xd4" + struct.pack("b", code) + data
+    if ln == 2:
+        return b"\xd5" + struct.pack("b", code) + data
+    if ln == 4:
+        return b"\xd6" + struct.pack("b", code) + data
+    if ln == 8:
+        return b"\xd7" + struct.pack("b", code) + data
+    if ln == 16:
+        return b"\xd8" + struct.pack("b", code) + data
+    if ln <= 0xFF:
+        return b"\xc7" + bytes([ln]) + struct.pack("b", code) + data
+    if ln <= 0xFFFF:
+        return b"\xc8" + struct.pack(">H", ln) + struct.pack("b", code) + data
+    return b"\xc9" + struct.pack(">I", ln) + struct.pack("b", code) + data
+
+
+class Unpacker:
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def feed(self, data: bytes) -> None:
+        self._buf.extend(data)
+
+    def unpack(self) -> Any:
+        if not self._buf:
+            raise NeedMoreData
+        val, n = _unpack_one(memoryview(self._buf), 0)
+        del self._buf[:n]
+        return val
+
+
+def _unpack_one(buf: memoryview, pos: int) -> tuple[Any, int]:
+    if pos >= len(buf):
+        raise NeedMoreData
+    b0 = buf[pos]
+    if b0 <= 0x7F:  # positive fixint
+        return b0, pos + 1
+    if 0xE0 <= b0 <= 0xFF:  # negative fixint
+        return struct.unpack("b", bytes([b0]))[0], pos + 1
+    if b0 == 0xC0:
+        return None, pos + 1
+    if b0 == 0xC2:
+        return False, pos + 1
+    if b0 == 0xC3:
+        return True, pos + 1
+    if 0xA0 <= b0 <= 0xBF:  # fixstr
+        ln = b0 - 0xA0
+        end = pos + 1 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        return bytes(buf[pos + 1 : end]).decode("utf-8"), end
+    if 0x90 <= b0 <= 0x9F:  # fixarray
+        n = b0 - 0x90
+        return _unpack_array(buf, pos + 1, n)
+    if 0x80 <= b0 <= 0x8F:  # fixmap
+        n = b0 - 0x80
+        return _unpack_map(buf, pos + 1, n)
+    if b0 == 0xCC:
+        if pos + 2 > len(buf):
+            raise NeedMoreData
+        return buf[pos + 1], pos + 2
+    if b0 == 0xCD:
+        if pos + 3 > len(buf):
+            raise NeedMoreData
+        return struct.unpack(">H", buf[pos + 1 : pos + 3])[0], pos + 3
+    if b0 == 0xCE:
+        if pos + 5 > len(buf):
+            raise NeedMoreData
+        return struct.unpack(">I", buf[pos + 1 : pos + 5])[0], pos + 5
+    if b0 == 0xCF:
+        if pos + 9 > len(buf):
+            raise NeedMoreData
+        return struct.unpack(">Q", buf[pos + 1 : pos + 9])[0], pos + 9
+    if b0 == 0xD0:
+        if pos + 2 > len(buf):
+            raise NeedMoreData
+        return struct.unpack("b", buf[pos + 1 : pos + 2])[0], pos + 2
+    if b0 == 0xD1:
+        if pos + 3 > len(buf):
+            raise NeedMoreData
+        return struct.unpack(">h", buf[pos + 1 : pos + 3])[0], pos + 3
+    if b0 == 0xD2:
+        if pos + 5 > len(buf):
+            raise NeedMoreData
+        return struct.unpack(">i", buf[pos + 1 : pos + 5])[0], pos + 5
+    if b0 == 0xD3:
+        if pos + 9 > len(buf):
+            raise NeedMoreData
+        return struct.unpack(">q", buf[pos + 1 : pos + 9])[0], pos + 9
+    if b0 == 0xCA:
+        if pos + 5 > len(buf):
+            raise NeedMoreData
+        return struct.unpack(">f", buf[pos + 1 : pos + 5])[0], pos + 5
+    if b0 == 0xCB:
+        if pos + 9 > len(buf):
+            raise NeedMoreData
+        return struct.unpack(">d", buf[pos + 1 : pos + 9])[0], pos + 9
+    if b0 == 0xD9:
+        if pos + 2 > len(buf):
+            raise NeedMoreData
+        ln = buf[pos + 1]
+        end = pos + 2 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        return bytes(buf[pos + 2 : end]).decode("utf-8"), end
+    if b0 == 0xDA:
+        if pos + 3 > len(buf):
+            raise NeedMoreData
+        ln = struct.unpack(">H", buf[pos + 1 : pos + 3])[0]
+        end = pos + 3 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        return bytes(buf[pos + 3 : end]).decode("utf-8"), end
+    if b0 == 0xDB:
+        if pos + 5 > len(buf):
+            raise NeedMoreData
+        ln = struct.unpack(">I", buf[pos + 1 : pos + 5])[0]
+        end = pos + 5 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        return bytes(buf[pos + 5 : end]).decode("utf-8"), end
+    if b0 == 0xC4:
+        if pos + 2 > len(buf):
+            raise NeedMoreData
+        ln = buf[pos + 1]
+        end = pos + 2 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        return bytes(buf[pos + 2 : end]), end
+    if b0 == 0xC5:
+        if pos + 3 > len(buf):
+            raise NeedMoreData
+        ln = struct.unpack(">H", buf[pos + 1 : pos + 3])[0]
+        end = pos + 3 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        return bytes(buf[pos + 3 : end]), end
+    if b0 == 0xC6:
+        if pos + 5 > len(buf):
+            raise NeedMoreData
+        ln = struct.unpack(">I", buf[pos + 1 : pos + 5])[0]
+        end = pos + 5 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        return bytes(buf[pos + 5 : end]), end
+    if b0 == 0xDC:
+        if pos + 3 > len(buf):
+            raise NeedMoreData
+        n = struct.unpack(">H", buf[pos + 1 : pos + 3])[0]
+        return _unpack_array(buf, pos + 3, n)
+    if b0 == 0xDD:
+        if pos + 5 > len(buf):
+            raise NeedMoreData
+        n = struct.unpack(">I", buf[pos + 1 : pos + 5])[0]
+        return _unpack_array(buf, pos + 5, n)
+    if b0 == 0xDE:
+        if pos + 3 > len(buf):
+            raise NeedMoreData
+        n = struct.unpack(">H", buf[pos + 1 : pos + 3])[0]
+        return _unpack_map(buf, pos + 3, n)
+    if b0 == 0xDF:
+        if pos + 5 > len(buf):
+            raise NeedMoreData
+        n = struct.unpack(">I", buf[pos + 1 : pos + 5])[0]
+        return _unpack_map(buf, pos + 5, n)
+    if b0 in (0xD4, 0xD5, 0xD6, 0xD7, 0xD8):
+        sizes = {0xD4: 1, 0xD5: 2, 0xD6: 4, 0xD7: 8, 0xD8: 16}
+        ln = sizes[b0]
+        end = pos + 2 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        code = struct.unpack("b", buf[pos + 1 : pos + 2])[0]
+        return Ext(code, bytes(buf[pos + 2 : end])), end
+    if b0 == 0xC7:
+        if pos + 3 > len(buf):
+            raise NeedMoreData
+        ln = buf[pos + 1]
+        end = pos + 3 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        code = struct.unpack("b", buf[pos + 2 : pos + 3])[0]
+        return Ext(code, bytes(buf[pos + 3 : end])), end
+    if b0 == 0xC8:
+        if pos + 4 > len(buf):
+            raise NeedMoreData
+        ln = struct.unpack(">H", buf[pos + 1 : pos + 3])[0]
+        end = pos + 4 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        code = struct.unpack("b", buf[pos + 3 : pos + 4])[0]
+        return Ext(code, bytes(buf[pos + 4 : end])), end
+    if b0 == 0xC9:
+        if pos + 6 > len(buf):
+            raise NeedMoreData
+        ln = struct.unpack(">I", buf[pos + 1 : pos + 5])[0]
+        end = pos + 6 + ln
+        if end > len(buf):
+            raise NeedMoreData
+        code = struct.unpack("b", buf[pos + 5 : pos + 6])[0]
+        return Ext(code, bytes(buf[pos + 6 : end])), end
+    raise ValueError(f"unknown msgpack byte 0x{b0:02x} at {pos}")
+
+
+def _unpack_array(buf: memoryview, pos: int, n: int) -> tuple[list[Any], int]:
+    out: list[Any] = []
+    for _ in range(n):
+        val, pos = _unpack_one(buf, pos)
+        out.append(val)
+    return out, pos
+
+
+def _unpack_map(buf: memoryview, pos: int, n: int) -> tuple[dict[Any, Any], int]:
+    out: dict[Any, Any] = {}
+    for _ in range(n):
+        key, pos = _unpack_one(buf, pos)
+        val, pos = _unpack_one(buf, pos)
+        out[key] = val
+    return out, pos
+
+# --- grid -------------------------------------------------------------------
+
+from typing import Any
+
+Cell = tuple[str, int]
+
+
+class Grid:
+    """Accumulates UI grid_line / hl_attr_define state; emits ANSI on flush."""
+
+    def __init__(self) -> None:
+        self._hl: dict[int, dict[str, Any]] = {}
+        self._width: dict[int, int] = {}
+        self._height: dict[int, int] = {}
+        self._rows: dict[int, list[list[tuple[str, int]]]] = {}
+        # From UI default_colors_set: Normal fg/bg (missing hl attrs inherit these).
+        self._default_fg: int | None = None
+        self._default_bg: int | None = None
+
+    def resize(self, height: int, width: int, grid: int = 1) -> None:
+        """Resize grid (rows, cols). Same as grid_resize."""
+        self.apply_grid_resize(grid, width, height)
+
+    def apply_grid_resize(self, grid: int, width: int, height: int) -> None:
+        self._width[grid] = width
+        self._height[grid] = height
+        rows = self._rows.setdefault(grid, [])
+        while len(rows) < height:
+            rows.append([(" ", 0)] * width)
+        del rows[height:]
+        for r in range(height):
+            row = rows[r]
+            if len(row) < width:
+                row.extend([(" ", 0)] * (width - len(row)))
+            elif len(row) > width:
+                del row[width:]
+            rows[r] = row
+
+    def apply_default_colors_set(
+        self,
+        rgb_fg: int,
+        rgb_bg: int,
+        _rgb_sp: int = 0,
+        _cterm_fg: int = 0,
+        _cterm_bg: int = 0,
+    ) -> None:
+        self._default_fg = int(rgb_fg)
+        self._default_bg = int(rgb_bg)
+
+    def apply_hl_attr_define(
+        self,
+        hl_id: int,
+        rgb_attrs: dict[str, Any],
+        _cterm_attrs: dict[str, Any],
+        _info: dict[str, Any],
+    ) -> None:
+        attrs: dict[str, Any] = {}
+        if "foreground" in rgb_attrs:
+            attrs["fg"] = int(rgb_attrs["foreground"])
+        if "background" in rgb_attrs:
+            attrs["bg"] = int(rgb_attrs["background"])
+        for key in ("bold", "italic", "underline", "reverse"):
+            if rgb_attrs.get(key):
+                attrs[key] = True
+        self._hl[hl_id] = attrs
+
+    def apply_grid_line(
+        self,
+        grid: int,
+        row: int,
+        col_start: int,
+        cells: list[list[Any]],
+        _wrap: bool,
+    ) -> None:
+        if grid not in self._width:
+            return
+        width = self._width[grid]
+        rows = self._rows.setdefault(grid, [])
+        while len(rows) <= row:
+            rows.append([(" ", 0)] * width)
+        line = list(rows[row])
+        if len(line) < width:
+            line.extend([(" ", 0)] * (width - len(line)))
+        col = col_start
+        last_hl_id = 0
+        for cell in cells:
+            text = str(cell[0])
+            if len(cell) > 1:
+                last_hl_id = int(cell[1])
+            hl_id = last_hl_id
+            repeat = int(cell[2]) if len(cell) > 2 else 1
+            for _ in range(repeat):
+                if not text:
+                    if col >= width:
+                        break
+                    line[col] = ("", hl_id)
+                    col += 1
+                    continue
+                for ch in text:
+                    if col >= width:
+                        break
+                    line[col] = (ch, hl_id)
+                    col += 1
+        rows[row] = line
+
+    def apply_grid_clear(self, grid: int) -> None:
+        if grid not in self._width:
+            return
+        w, h = self._width[grid], self._height.get(grid, 0)
+        self._rows[grid] = [[(" ", 0)] * w for _ in range(h)]
+
+    def apply_grid_destroy(self, grid: int) -> None:
+        self._rows.pop(grid, None)
+        self._width.pop(grid, None)
+        self._height.pop(grid, None)
+
+    def _resolve(self, hl_id: int) -> dict[str, Any]:
+        """Neovim: missing rgb attrs inherit Normal (default_colors_set)."""
+        attrs: dict[str, Any] = {}
+        if self._default_fg is not None:
+            attrs["fg"] = self._default_fg
+        if self._default_bg is not None:
+            attrs["bg"] = self._default_bg
+        attrs.update(self._hl.get(hl_id, {}))
+        if attrs.get("reverse"):
+            attrs["fg"], attrs["bg"] = attrs.get("bg"), attrs.get("fg")
+        return attrs
+
+    def _sgr(self, hl_id: int, *, reset: bool = False) -> bytes:
+        attrs = self._resolve(hl_id)
+        parts: list[str] = []
+        if reset:
+            parts.append("0")
+        if attrs.get("bold"):
+            parts.append("1")
+        if attrs.get("italic"):
+            parts.append("3")
+        if attrs.get("underline"):
+            parts.append("4")
+        # reverse already swapped in _resolve; do not emit 7
+        if "fg" in attrs and attrs["fg"] is not None:
+            c = int(attrs["fg"])
+            parts.append(f"38;2;{(c >> 16) & 0xFF};{(c >> 8) & 0xFF};{c & 0xFF}")
+        if "bg" in attrs and attrs["bg"] is not None:
+            c = int(attrs["bg"])
+            parts.append(f"48;2;{(c >> 16) & 0xFF};{(c >> 8) & 0xFF};{c & 0xFF}")
+        if not parts or (reset and len(parts) == 1):
+            return b"\x1b[0m"
+        return f"\x1b[{';'.join(parts)}m".encode()
+
+    @staticmethod
+    def _is_eob_row(row: list[tuple[str, int]]) -> bool:
+        text = "".join(ch for ch, _ in row).rstrip()
+        return text == "~" or (len(text) > 0 and set(text) <= {"~"})
+
+    def _row_to_ansi(self, row: list[tuple[str, int]]) -> bytes:
+        # Keep default-bg padding so blank lines / table tails match the TUI.
+        # Only drop trailing spaces when we have no Normal bg to paint.
+        trimmed = list(row)
+        if self._default_bg is None:
+            while trimmed and trimmed[-1][0] == " " and trimmed[-1][1] == 0:
+                trimmed.pop()
+        out = bytearray()
+        cur_hl: int | None = None
+        buf = bytearray()
+        for ch, hl_id in trimmed:
+            if not ch:
+                continue
+            if hl_id != cur_hl:
+                if buf:
+                    out.extend(buf)
+                    buf.clear()
+                out.extend(self._sgr(hl_id, reset=cur_hl is not None))
+                cur_hl = hl_id
+            buf.extend(ch.encode("utf-8"))
+        if buf:
+            out.extend(buf)
+        if out:
+            out.extend(b"\x1b[0m")
+        return bytes(out)
+
+    def to_ansi(self, grid: int = 1) -> bytes:
+        rows = self._rows.get(grid, [])
+        # Drop end-of-buffer `~` rows and anything below (status/cmdline chrome).
+        end = len(rows)
+        for i, row in enumerate(rows):
+            if self._is_eob_row(row):
+                end = i
+                break
+        lines = [self._row_to_ansi(row) for row in rows[:end]]
+        while lines and lines[-1] in (b"", b"\x1b[0m"):
+            lines.pop()
+        # Trailing blank buffer lines (no text) — keep; user content may need them.
+        return b"\n".join(lines) + (b"\n" if lines else b"")
+
+# --- shot2ansi --------------------------------------------------------------
+
+# Drop terminal mode / cursor / charset noise; keep SGR (m) and text.
+CSI_DROP = re.compile(
+    rb"\x1b\[\?(?:25[lh]|[0-9;]*[hl])"  # DEC private modes (cursor, etc.)
+    rb"|\x1b\[[0-9;]*[HfJABCD]"  # cursor / erase
+    rb"|\x1b\(B"  # G0 charset → ASCII
+)
+SGR = re.compile(rb"\x1b\[[0-9;]*m")
+
+
+def plain(line: bytes) -> bytes:
+    return SGR.sub(b"", line)
+
+
+def sgr_resets(seq: bytes) -> bool:
+    """True if this SGR clears prior attrs (0 / empty)."""
+    if seq in (b"\x1b[m", b"\x1b[0m"):
+        return True
+    # \x1b[0;...m starts from defaults
+    return seq.startswith(b"\x1b[0;") or seq.startswith(b"\x1b[0m")
+
+
+def split_preserving_sgr(body: bytes) -> list[bytes]:
+    """Split CR LF rows, carrying SGR state into the next line.
+
+    nvim__screenshot omits SGR when the next cell matches the previous
+    cell's attrs — including across wrapped rows — so naive splits drop
+    leading style on the following line.
+    """
+    sgr_state = b""
+    line = bytearray()
+    out: list[bytes] = []
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i : i + 2] == b"\r\n":
+            out.append(bytes(line))
+            # Next row inherits current attrs until an explicit SGR.
+            line = bytearray(sgr_state)
+            i += 2
+            continue
+        if body[i] == 0x0A:  # lone LF
+            out.append(bytes(line))
+            line = bytearray(sgr_state)
+            i += 1
+            continue
+        m = SGR.match(body, i)
+        if m:
+            seq = m.group(0)
+            line.extend(seq)
+            if sgr_resets(seq):
+                sgr_state = b"" if seq in (b"\x1b[m", b"\x1b[0m") else seq
+            else:
+                sgr_state += seq
+            i = m.end()
+            continue
+        line.append(body[i])
+        i += 1
+    if line:
+        out.append(bytes(line))
+    return out
+
+
+def shot2ansi_main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    data = open(args[0], "rb").read() if args else sys.stdin.buffer.read()
+    if not data:
+        return 1
+    nl = data.find(b"\n")
+    if nl < 0:
+        return 1
+    header, body = data[:nl].decode("ascii", "replace"), data[nl + 1 :]
+    try:
+        height, width = (int(x) for x in header.split(",", 1))
+    except ValueError:
+        height, width = 0, 0
+    del height, width
+
+    # Screenshot starts with clear-screen; content follows.
+    idx = body.find(b"\x1b[2J")
+    if idx >= 0:
+        body = body[idx + 4 :]
+
+    body = CSI_DROP.sub(b"", body)
+    raw_lines = split_preserving_sgr(body)
+    out: list[bytes] = []
+    for raw in raw_lines:
+        if not raw:
+            continue
+        raw = raw.rstrip(b"\r")
+        p = plain(raw)
+        # End-of-buffer filler
+        if re.fullmatch(rb"~[\s~]*", p):
+            break
+        # Drop cmdline / error / status crumbs that sometimes land on last rows
+        if p.startswith(b"E1568:") or p.startswith(b"E[0-9]"):
+            break
+        if b"Terminal did not respond" in p:
+            break
+        # Statusline leak (laststatus not fully cleared)
+        if p.startswith(b"NORMAL") or p.lstrip().startswith(b"NORMAL "):
+            break
+        out.append(raw)
+
+    # Trim trailing blank (whitespace-only) rows
+    while out and not plain(out[-1]).strip():
+        out.pop()
+
+    sys.stdout.buffer.write(b"\n".join(out) + (b"\n" if out else b""))
+    return 0
+
+# --- embed ------------------------------------------------------------------
+
+class NvimEmbed:
+    def __init__(
+        self,
+        argv: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        on_notify: Callable[[str, list[Any]], None] | None = None,
+    ) -> None:
+        self._on_notify = on_notify or (lambda _m, _a: None)
+        self._unpacker = Unpacker()
+        self._next_id = 1
+        self._pending: dict[int, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
+        self._proc = subprocess.Popen(
+            argv or ["nvim", "--embed", "--clean", "-n", "--headless"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            bufsize=0,
+        )
+        assert self._proc.stdin and self._proc.stdout
+        self._stdin = self._proc.stdin
+        self._stdout_fd = self._proc.stdout.fileno()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def _read_loop(self) -> None:
+        assert self._proc.stdout
+        while True:
+            chunk = self._proc.stdout.read(1 << 16)
+            if not chunk:
+                break
+            self._unpacker.feed(chunk)
+            while True:
+                try:
+                    msg = self._unpacker.unpack()
+                except NeedMoreData:
+                    break
+                self._dispatch(msg)
+
+    def _dispatch(self, msg: Any) -> None:
+        if not isinstance(msg, list) or not msg:
+            return
+        kind = msg[0]
+        if kind == 1 and len(msg) >= 4:  # response
+            req_id = msg[1]
+            with self._lock:
+                slot = self._pending.pop(req_id, None)
+            if slot is not None:
+                slot["error"] = msg[2]
+                slot["result"] = msg[3]
+                slot["event"].set()
+        elif kind == 2 and len(msg) >= 3:  # notification
+            self._on_notify(msg[1], msg[2] if isinstance(msg[2], list) else [])
+        elif kind == 0 and len(msg) >= 4:  # request from nvim (e.g. "vimenter")
+            req_id = msg[1]
+            self._send([1, req_id, None, None])
+
+    def _send(self, obj: Any) -> None:
+        with self._send_lock:
+            self._stdin.write(pack(obj))
+            self._stdin.flush()
+
+    def request(self, method: str, *args: Any, timeout: float | None = None) -> Any:
+        req_id = self._next_id
+        self._next_id += 1
+        ev = threading.Event()
+        slot = {"event": ev, "error": None, "result": None}
+        with self._lock:
+            self._pending[req_id] = slot
+        self._send([0, req_id, method, list(args)])
+        deadline = time.time() + (timeout if timeout is not None else 30)
+        while not ev.is_set():
+            if time.time() >= deadline:
+                raise TimeoutError(f"RPC timeout: {method}")
+            if self._proc.poll() is not None:
+                with self._lock:
+                    self._pending.pop(req_id, None)
+                if slot["error"] is not None:
+                    raise RuntimeError(slot["error"])
+                return slot["result"]
+            ev.wait(timeout=0.05)
+        if slot["error"] is not None:
+            raise RuntimeError(slot["error"])
+        return slot["result"]
+
+    def ui_attach(self, width: int, height: int, **options: Any) -> None:
+        opts = {"rgb": True, "ext_linegrid": True, **options}
+        self.request("nvim_ui_attach", width, height, opts)
+
+    def close(self) -> None:
+        try:
+            self._stdin.close()
+        except OSError:
+            pass
+        self._proc.wait(timeout=5)
+
+
+def _estimate_rows(paths: list[str]) -> int:
+    total = 0
+    for path in paths:
+        try:
+            with open(path, "rb") as fh:
+                total += sum(1 for _ in fh)
+        except OSError:
+            total += 40
+    if not paths:
+        total = 40
+    return max(24, min(200, total + 32))
+
+
+def _nvim_argv(root: str) -> list[str]:
+    root_esc = root.replace("\\", "\\\\").replace("'", "\\'")
+    return [
+        "nvim",
+        "--embed",
+        "-n",
+        "--cmd",
+        "let g:nvimcat = 1",
+        "--cmd",
+        f"let g:nvimcat_root = '{root_esc}'",
+        "--cmd",
+        "let g:copilot_enabled = v:false",
+        "--cmd",
+        f"set rtp^={root}",
+    ]
+
+
+def _apply_redraw(grid: Grid, events: list[Any]) -> bool:
+    flushed = False
+    for ev in events:
+        if not ev:
+            continue
+        name = ev[0]
+        if name == "flush":
+            flushed = True
+            continue
+        for item in ev[1:]:
+            if name == "grid_resize" and isinstance(item, list) and len(item) >= 3:
+                grid.apply_grid_resize(int(item[0]), int(item[1]), int(item[2]))
+            elif name == "grid_line" and isinstance(item, list) and len(item) >= 5:
+                grid.apply_grid_line(
+                    int(item[0]), int(item[1]), int(item[2]), item[3], bool(item[4])
+                )
+            elif name == "grid_clear" and isinstance(item, list) and item:
+                grid.apply_grid_clear(int(item[0]))
+            elif name == "grid_destroy" and isinstance(item, list) and item:
+                grid.apply_grid_destroy(int(item[0]))
+            elif name == "hl_attr_define" and isinstance(item, list) and len(item) >= 4:
+                grid.apply_hl_attr_define(int(item[0]), item[1], item[2], item[3])
+            elif name == "default_colors_set" and isinstance(item, list) and len(item) >= 2:
+                grid.apply_default_colors_set(*item[:5])
+    return flushed
+
+
+def capture(width: int, files: list[str]) -> int:
+    root = os.environ.get("NVIMCAT_ROOT") or str(_ROOT)
+    height = _estimate_rows(files)
+    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "30"))
+
+    env = os.environ.copy()
+    env["NVIMCAT"] = "1"
+    env["NVIMCAT_ROOT"] = root
+    env["NVIMCAT_WIDTH"] = str(width)
+    env["NVIMCAT_EMBED"] = "1"
+    env["NVIMCAT_FILES"] = "\x1e".join(files) + ("\x1e" if files else "")
+
+    grid = Grid()
+    grid_lock = threading.Lock()
+    flush_ev = threading.Event()
+    awaiting_resize_flush = False
+    output_parts: list[bytes] = []
+
+    def on_notify(method: str, args: list[Any]) -> None:
+        if method != "redraw":
+            return
+        with grid_lock:
+            flushed = _apply_redraw(grid, args)
+        if flushed:
+            flush_ev.set()
+
+    nv = NvimEmbed(argv=_nvim_argv(root), env=env, on_notify=on_notify)
+    deadline = time.time() + timeout
+    rc = 1
+    try:
+        nv.ui_attach(width, height)
+        nv.request("nvim_command", f"luafile {root}/scripts/cli-entry.lua")
+
+        while time.time() < deadline:
+            if nv._proc.poll() is not None:
+                print("nvimcat: nvim exited early", file=sys.stderr)
+                break
+
+            remaining = max(0.0, deadline - time.time())
+            wait = min(0.1, remaining)
+            if not flush_ev.wait(timeout=wait):
+                continue
+            flush_ev.clear()
+
+            try:
+                done = nv.request("nvim_get_var", "nvimcat_done", timeout=remaining)
+            except (TimeoutError, RuntimeError):
+                done = 0
+            if done == 1:
+                sys.stdout.buffer.write(b"".join(output_parts))
+                sys.stdout.buffer.flush()
+                try:
+                    nv.request("nvim_command", "qa!", timeout=5)
+                except (TimeoutError, RuntimeError):
+                    pass
+                rc = 0
+                break
+
+            try:
+                cap = nv.request("nvim_get_var", "nvimcat_capture", timeout=remaining)
+            except (TimeoutError, RuntimeError):
+                continue
+            if cap != 1:
+                continue
+
+            if not awaiting_resize_flush:
+                try:
+                    rows = nv.request("nvim_get_var", "nvimcat_rows", timeout=remaining)
+                except (TimeoutError, RuntimeError):
+                    rows = None
+                if isinstance(rows, int) and rows > 0 and rows != height:
+                    nv.request("nvim_ui_try_resize", width, rows, timeout=remaining)
+                    height = rows
+                    nv.request("nvim_command", "redraw!", timeout=remaining)
+                    awaiting_resize_flush = True
+                    continue
+
+            with grid_lock:
+                part = grid.to_ansi()
+            if output_parts:
+                output_parts.append(b"\n")
+            output_parts.append(part)
+            awaiting_resize_flush = False
+            try:
+                nv.request("nvim_set_var", "nvimcat_capture", 0, timeout=remaining)
+            except (TimeoutError, RuntimeError):
+                pass
+        else:
+            print("nvimcat: timed out waiting for capture", file=sys.stderr)
+    finally:
+        nv.close()
+    return rc
+
+
+def smoke(width: int) -> int:
+    nv = NvimEmbed()
+    try:
+        nv.ui_attach(width, 24)
+        nv.request("nvim_command", "qa!")
+    finally:
+        nv.close()
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--smoke":
+        return smoke(int(sys.argv[2]))
+    if len(sys.argv) < 3:
+        print("usage: nvimcat-embed WIDTH <file>...", file=sys.stderr)
+        print("       nvimcat-embed --smoke WIDTH", file=sys.stderr)
+        return 2
+    width = int(sys.argv[1])
+    files = sys.argv[2:]
+    return capture(width, files)
+
+# --- CLI --------------------------------------------------------------------
+
+def _detect_width() -> int:
+    env = os.environ.get("NVIMCAT_WIDTH", "").strip()
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    try:
+        out = subprocess.check_output(
+            ["bash", "-c", "stty size < /dev/tty"], stderr=subprocess.DEVNULL
+        )
+        cols = int(out.split()[1])
+        if cols > 0:
+            return cols
+    except (OSError, subprocess.CalledProcessError, IndexError, ValueError):
+        pass
+    try:
+        out = subprocess.check_output(["tput", "cols"], stderr=subprocess.DEVNULL)
+        cols = int(out.strip())
+        if cols > 0:
+            return cols
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        pass
+    cols = os.environ.get("COLUMNS", "").strip()
+    if cols.isdigit() and int(cols) > 0:
+        return int(cols)
+    return 80
+
+
+def _abs_files(files: list[str]) -> list[str]:
+    out: list[str] = []
+    for f in files:
+        p = Path(f)
+        out.append(str(p.resolve()) if p.exists() else f)
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    os.environ.setdefault("NVIMCAT", "1")
+    os.environ["NVIMCAT_ROOT"] = str(_ROOT)
+
+    if argv and argv[0] == "--shot2ansi":
+        return shot2ansi_main(argv[1:])
+
+    if argv and argv[0] == "--smoke":
+        width = int(argv[1]) if len(argv) > 1 else _detect_width()
+        return smoke(width)
+
+    # Legacy: WIDTH file... (old nvimcat-embed argv)
+    if len(argv) >= 2 and argv[0].isdigit() and not Path(argv[0]).exists():
+        width = int(argv[0])
+        files = _abs_files(argv[1:])
+        os.environ["NVIMCAT_WIDTH"] = str(width)
+        return capture(width, files)
+
+    if not argv:
+        print("usage: nvimcat [--width N] <file>...", file=sys.stderr)
+        print("       nvimcat --smoke [WIDTH]", file=sys.stderr)
+        print("       nvimcat --shot2ansi [screenshot]", file=sys.stderr)
+        return 2
+
+    from shutil import which
+
+    if which("nvim") is None:
+        print("nvimcat: nvim not found on PATH", file=sys.stderr)
+        return 127
+
+    width = _detect_width()
+    files = argv
+    if files[:1] == ["--width"]:
+        if len(files) < 3:
+            print("usage: nvimcat --width N <file>...", file=sys.stderr)
+            return 2
+        width = int(files[1])
+        files = files[2:]
+    files = _abs_files(files)
+    os.environ["NVIMCAT_WIDTH"] = str(width)
+    return capture(width, files)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -531,7 +531,7 @@ function M.dump(opts)
   local path = vim.fn.tempname() .. ".nvimcat.shot"
   vim.api.nvim__screenshot(path)
   local root = plugin_root() or "."
-  local ansi = vim.fn.system({ "python3", root .. "/bin/nvimcat-shot2ansi", path })
+  local ansi = vim.fn.system({ "python3", root .. "/bin/nvimcat", "--shot2ansi", path })
   pcall(os.remove, path)
   if vim.v.shell_error ~= 0 then
     error("nvimcat: shot2ansi failed: " .. tostring(ansi))

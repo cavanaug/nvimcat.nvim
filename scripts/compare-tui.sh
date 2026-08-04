@@ -208,15 +208,17 @@ for i in range(n):
     tc2, cc2 = content(tc), content(cc)
     for j, (a, b) in enumerate(zip(tc2, cc2)):
         if a["ch"].isspace() and b["ch"].isspace():
-            # still check bg bars on spaces when both claim a bg
-            if a.get("bg") and b.get("bg") and a["bg"].lower() != b["bg"].lower():
-                mism.append(f"L{i}c{j} space bg {a['bg']}!={b['bg']}")
+            # Catch missing Normal bg on spaces (one side None, other set).
+            ab, bb = (a.get("bg") or "").lower(), (b.get("bg") or "").lower()
+            if ab != bb and (ab or bb):
+                mism.append(f"L{i}c{j} space bg {a.get('bg')!r}!={b.get('bg')!r}")
             continue
         for key, name in (("fg", "fg"), ("bg", "bg"), ("b", "bold"), ("i", "italic")):
             av, bv = a.get(key), b.get(key)
             if key in ("fg", "bg"):
-                if av and bv and str(av).lower() != str(bv).lower():
-                    mism.append(f"L{i}c{j} {a['ch']!r} {name} {av}!={bv}")
+                al, bl = (str(av).lower() if av else ""), (str(bv).lower() if bv else "")
+                if al != bl and (al or bl):
+                    mism.append(f"L{i}c{j} {a['ch']!r} {name} {av!r}!={bv!r}")
             else:
                 if bool(av) != bool(bv):
                     mism.append(f"L{i}c{j} {a['ch']!r} {name} {av}!={bv}")

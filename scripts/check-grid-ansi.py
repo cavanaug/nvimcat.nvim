@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 import os
-import sys
+import runpy
 
-_BIN = os.path.join(os.path.dirname(__file__), "..", "bin")
-sys.path.insert(0, os.path.abspath(_BIN))
-
-from nvimcat_grid import Grid  # noqa: E402
+_BIN = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin", "nvimcat"))
+mod = runpy.run_path(_BIN)
+Grid = mod["Grid"]
 
 # Brief fixture: bold red truecolor "Hi!"
 g = Grid()
@@ -39,5 +38,26 @@ g.apply_hl_attr_define(2, {"foreground": 0x0000FF}, {}, {})
 g.apply_grid_line(1, 0, 0, [["A", 1], ["B", 2]], False)
 out = g.to_ansi()
 assert out == b"\x1b[1;38;2;255;0;0mA\x1b[0;38;2;0;0;255mB\x1b[0m\n"
+
+# Missing hl bg inherits Normal from default_colors_set; hl 0 paints Normal too
+g = Grid()
+g.resize(1, 4)
+g.apply_default_colors_set(0xE2E2E3, 0x2C2E34)
+g.apply_hl_attr_define(1, {"foreground": 0xFC5D7C, "bold": True}, {}, {})
+g.apply_grid_line(1, 0, 0, [["│", 1], [" ", 0], ["T", 1]], False)
+out = g.to_ansi()
+assert b"48;2;44;46;52" in out  # Normal bg on bold border and default space
+assert out.startswith(b"\x1b[1;38;2;252;93;124;48;2;44;46;52m")
+
+# Trailing eob `~` rows are omitted
+g = Grid()
+g.resize(3, 3)
+g.apply_hl_attr_define(1, {"foreground": 0xFFFFFF}, {}, {})
+g.apply_hl_attr_define(2, {"foreground": 0x414550}, {}, {})
+g.apply_grid_line(1, 0, 0, [["Hi", 1]], False)
+g.apply_grid_line(1, 1, 0, [["~", 2]], False)
+g.apply_grid_line(1, 2, 0, [["~", 2]], False)
+out = g.to_ansi()
+assert b"Hi" in out and b"~" not in out
 
 print("OK grid_ansi")
