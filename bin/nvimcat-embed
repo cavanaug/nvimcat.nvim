@@ -14,6 +14,7 @@ if _BIN not in sys.path:
     sys.path.insert(0, _BIN)
 
 import nvimcat_msgpack as mp  # noqa: E402
+from nvimcat_grid import Grid  # noqa: E402,F401 — Task 4 wires redraw → grid
 
 
 class NvimEmbed:
