@@ -27,6 +27,7 @@ class NvimEmbed:
         self._next_id = 1
         self._pending: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._proc = subprocess.Popen(
             argv or ["nvim", "--embed", "--clean", "-n", "--headless"],
             stdin=subprocess.PIPE,
@@ -71,13 +72,12 @@ class NvimEmbed:
             req_id, method, args = msg[1], msg[2], msg[3]
             result = None
             error = None
-            if method == "redraw":
-                pass
             self._send([1, req_id, error, result])
 
     def _send(self, obj: Any) -> None:
-        self._stdin.write(mp.pack(obj))
-        self._stdin.flush()
+        with self._send_lock:
+            self._stdin.write(mp.pack(obj))
+            self._stdin.flush()
 
     def request(self, method: str, *args: Any) -> Any:
         req_id = self._next_id

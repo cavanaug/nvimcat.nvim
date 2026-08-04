@@ -96,8 +96,10 @@ def _pack_ext(code: int, data: bytes) -> bytes:
     if ln == 2:
         return b"\xd5" + struct.pack("b", code) + data
     if ln == 4:
-        return b"\xd7" + struct.pack("b", code) + data
+        return b"\xd6" + struct.pack("b", code) + data
     if ln == 8:
+        return b"\xd7" + struct.pack("b", code) + data
+    if ln == 16:
         return b"\xd8" + struct.pack("b", code) + data
     if ln <= 0xFF:
         return b"\xc7" + bytes([ln]) + struct.pack("b", code) + data
@@ -256,7 +258,7 @@ def _unpack_one(buf: memoryview, pos: int) -> tuple[Any, int]:
         n = struct.unpack(">I", buf[pos + 1 : pos + 5])[0]
         return _unpack_map(buf, pos + 5, n)
     if b0 in (0xD4, 0xD5, 0xD6, 0xD7, 0xD8):
-        sizes = {0xD4: 1, 0xD5: 2, 0xD6: 4, 0xD7: 4, 0xD8: 8}
+        sizes = {0xD4: 1, 0xD5: 2, 0xD6: 4, 0xD7: 8, 0xD8: 16}
         ln = sizes[b0]
         end = pos + 2 + ln
         if end > len(buf):
@@ -327,4 +329,9 @@ if __name__ == "__main__":
     for obj in samples:
         u.feed(pack(obj))
         assert u.unpack() == obj
+    for ln in (1, 2, 4, 8, 16, 32):
+        ext = Ext(-1, bytes(ln))
+        u.feed(pack(ext))
+        got = u.unpack()
+        assert isinstance(got, Ext) and got.code == ext.code and got.data == ext.data
     print("OK msgpack")
