@@ -75,7 +75,7 @@ Inside Neovim:
 
 ```lua
 require("nvimcat").setup({
-  width = 80,
+  -- width = 100,  -- optional; default is NVIMCAT_WIDTH / terminal cols
   timeout_ms = 8000,
   disable_plugins = { "copilot.lua", "copilot-cmp", "blink-copilot" },
 })
