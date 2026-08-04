@@ -51,6 +51,7 @@ No Lazy entry required. The Lua package loads from the repo beside `bin/`.
 
 ```bash
 nvimcat notes.md
+# uses current terminal width (override if needed):
 NVIMCAT_WIDTH=100 nvimcat docs/guide.md
 NVIMCAT_VERBOSE=1 nvimcat notes.md   # stderr progress
 ```

@@ -5,7 +5,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export NVIMCAT=1
 export NVIMCAT_ROOT="$ROOT"
-export NVIMCAT_WIDTH="${NVIMCAT_WIDTH:-${COLUMNS:-80}}"
+
+# Width: explicit NVIMCAT_WIDTH > controlling TTY > tput > COLUMNS > lua fallback.
+if [[ -z "${NVIMCAT_WIDTH:-}" ]]; then
+  cols=""
+  # Prefer controlling TTY so `nvimcat file | less -R` still matches the terminal.
+  if cols="$(stty size < /dev/tty 2>/dev/null | awk '{print $2}')"; then
+    :
+  else
+    cols=""
+  fi
+  if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
+    cols="$(tput cols 2>/dev/null || true)"
+  fi
+  if [[ ! "${cols}" =~ ^[1-9][0-9]*$ ]]; then
+    cols="${COLUMNS:-}"
+  fi
+  if [[ "${cols}" =~ ^[1-9][0-9]*$ ]]; then
+    export NVIMCAT_WIDTH="$cols"
+  fi
+fi
 
 if ! command -v nvim >/dev/null 2>&1; then
   echo "nvimcat: nvim not found on PATH" >&2

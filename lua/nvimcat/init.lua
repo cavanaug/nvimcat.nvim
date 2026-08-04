@@ -11,7 +11,7 @@ local M = {}
 ---@field disable_plugins? string[]
 
 local DEFAULTS = {
-  width = tonumber(vim.env.COLUMNS) or 80,
+  -- width: nil → NVIMCAT_WIDTH / COLUMNS / vim.o.columns (see prepare_chrome)
   min_wait_ms = 80,
   settle_ms = 120,
   timeout_ms = 8000,
@@ -869,6 +869,14 @@ local function silence_ui_noise()
 end
 
 local function prepare_chrome(opts)
+  local width = opts.width
+    or tonumber(vim.env.NVIMCAT_WIDTH)
+    or tonumber(vim.env.COLUMNS)
+    or vim.o.columns
+  if not width or width < 1 then
+    width = 80 -- last resort when no TTY / env
+  end
+  opts.width = width
   vim.o.termguicolors = true
   vim.o.cmdheight = 0
   vim.o.laststatus = 0
@@ -880,7 +888,7 @@ local function prepare_chrome(opts)
   vim.o.relativenumber = false
   vim.o.signcolumn = "no"
   vim.o.foldcolumn = "0"
-  vim.o.columns = opts.width
+  vim.o.columns = width
   vim.opt.fillchars:append({ eob = "~" })
   disable_side_effect_plugins(opts)
   silence_ui_noise()
@@ -1099,9 +1107,7 @@ function M.cli()
 
   disable_side_effect_plugins(config)
 
-  local opts = merge({
-    width = tonumber(vim.env.NVIMCAT_WIDTH) or tonumber(vim.env.COLUMNS) or 80,
-  })
+  local opts = merge({})
 
   local files = files_from_env_or_argv()
   if #files == 0 then
