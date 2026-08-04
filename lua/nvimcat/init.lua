@@ -7,6 +7,7 @@ local M = {}
 ---@field settle_ms? integer
 ---@field timeout_ms? integer
 ---@field max_lines? integer
+---@field install_cli? boolean
 ---@field disable_plugins? string[]
 
 local DEFAULTS = {
@@ -15,6 +16,7 @@ local DEFAULTS = {
   settle_ms = 120,
   timeout_ms = 8000,
   max_lines = 5000,
+  install_cli = true,
   disable_plugins = {
     "copilot.lua",
     "copilot-cmp",
@@ -33,10 +35,62 @@ local function merge(opts)
   return vim.tbl_deep_extend("force", config, opts or {})
 end
 
+local function plugin_root()
+  local root = vim.env.NVIMCAT_ROOT or vim.g.nvimcat_root
+  if type(root) == "string" and root ~= "" then
+    return root
+  end
+  local src = debug.getinfo(1, "S").source
+  if src:sub(1, 1) == "@" then
+    -- lua/nvimcat/init.lua → repo root
+    return vim.fn.fnamemodify(src:sub(2), ":p:h:h:h")
+  end
+  return nil
+end
+
+--- Symlink bin/nvimcat into ~/.local/bin (no clobber).
+---@return boolean ok
+function M.install_cli()
+  local root = plugin_root()
+  if not root then
+    vim.notify("nvimcat: cannot resolve plugin root for CLI install", vim.log.levels.WARN)
+    return false
+  end
+  local src = root .. "/bin/nvimcat"
+  if vim.fn.filereadable(src) ~= 1 then
+    vim.notify("nvimcat: missing " .. src, vim.log.levels.WARN)
+    return false
+  end
+  local bindir = vim.fn.expand("~/.local/bin")
+  vim.fn.mkdir(bindir, "p")
+  local dest = bindir .. "/nvimcat"
+  local uv = vim.uv or vim.loop
+  local stat = uv.fs_lstat(dest)
+  if stat then
+    if stat.type == "link" then
+      local current = uv.fs_readlink(dest)
+      if current == src then
+        return true
+      end
+    end
+    vim.notify("nvimcat: " .. dest .. " exists; not overwriting", vim.log.levels.WARN)
+    return false
+  end
+  local ok, err = uv.fs_symlink(src, dest)
+  if not ok then
+    vim.notify("nvimcat: symlink failed: " .. tostring(err), vim.log.levels.WARN)
+    return false
+  end
+  return true
+end
+
 --- Plugin setup (Lazy `opts` / `require(...).setup`).
 ---@param opts? nvimcat.Opts
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", DEFAULTS, opts or {})
+  if config.install_cli then
+    M.install_cli()
+  end
 end
 
 local function decor_fingerprint(buf)
