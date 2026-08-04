@@ -315,16 +315,50 @@ local function ansi_color(hex, kind)
   return string.format("\27[48;2;%d;%d;%dm", r, g, b)
 end
 
+--- screenattr misses hl_eol extmark backgrounds (e.g. RenderMarkdownH1Bg).
+---@param win integer
+---@return table<integer, string> screen_row -> #rrggbb
+local function extmark_screen_bgs(win)
+  local bgs = {}
+  local buf = vim.api.nvim_win_get_buf(win)
+  local function hl_bg(name)
+    if not name then
+      return nil
+    end
+    local h = vim.api.nvim_get_hl(0, { name = name, link = false })
+    if h.bg then
+      return string.format("#%06x", h.bg)
+    end
+    return nil
+  end
+  for _, id in pairs(vim.api.nvim_get_namespaces()) do
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, id, 0, -1, { details = true })) do
+      local d = m[4] or {}
+      local bg = hl_bg(d.hl_group) or hl_bg(d.line_hl_group)
+      if bg then
+        local spos = vim.fn.screenpos(win, m[2] + 1, math.max(1, m[3] + 1))
+        if spos.row and spos.row > 0 then
+          bgs[spos.row] = bg
+        end
+      end
+    end
+  end
+  return bgs
+end
+
 local function capture_window()
   vim.cmd("redraw!")
   local rows = vim.o.lines
   local cols = vim.o.columns
+  local win = vim.api.nvim_get_current_win()
+  local row_bgs = extmark_screen_bgs(win)
   local out = {}
 
   for row = 1, rows do
     local plain = {}
     local ansi = {}
     local last = ""
+    local row_bg = row_bgs[row]
     for col = 1, cols do
       local ch = vim.fn.screenstring(row, col)
       if ch == "" then
@@ -333,7 +367,7 @@ local function capture_window()
       plain[#plain + 1] = ch
       local attr = vim.fn.screenattr(row, col)
       local fg = hex_from_attr(attr, "fg")
-      local bg = hex_from_attr(attr, "bg")
+      local bg = hex_from_attr(attr, "bg") or row_bg
       local bold = vim.fn.synIDattr(attr, "bold") == "1"
       local key = tostring(fg) .. "|" .. tostring(bg) .. "|" .. tostring(bold)
       if key ~= last then
@@ -422,13 +456,21 @@ end
 local function disable_anti_conceal()
   pcall(function()
     local state = require("render-markdown.state")
-    if state.config and state.config.anti_conceal then
-      state.config.anti_conceal.enabled = false
-    end
-    for _, cfg in pairs(state.cache or {}) do
+    ---@param cfg table?
+    local function disable(cfg)
+      if not cfg then
+        return
+      end
       if cfg.anti_conceal then
+        -- Want non-cursor rendering: hide anti-conceal for the whole dump.
         cfg.anti_conceal.enabled = false
       end
+      -- Force updates must not be dropped while decorator.running is true.
+      cfg.debounce = 0
+    end
+    disable(state.config)
+    for _, cfg in pairs(state.cache or {}) do
+      disable(cfg)
     end
   end)
 end
@@ -546,6 +588,18 @@ function M.dump(opts)
       return false
     end)
   end
+
+  -- Park cursor off content and re-render so anti-conceal / cursorline
+  -- variants match the "cursor not on this line" look.
+  disable_anti_conceal()
+  pcall(function()
+    local last = vim.api.nvim_buf_line_count(buf)
+    vim.api.nvim_win_set_cursor(win, { last, 0 })
+  end)
+  try_force_render(buf, win)
+  vim.wait(80, function()
+    return false
+  end)
 
   vim.cmd("redraw!")
   if vim.env.NVIMCAT_VERBOSE == "1" then

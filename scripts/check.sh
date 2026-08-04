@@ -22,14 +22,18 @@ elapsed=$((end_ms - start_ms))
 python3 - "$OUT" "$elapsed" <<'PY'
 import re, sys
 from pathlib import Path
-plain = re.sub(r"\x1b\[[0-9;]*m", "", Path(sys.argv[1]).read_text())
+raw = Path(sys.argv[1]).read_text()
+plain = re.sub(r"\x1b\[[0-9;]*m", "", raw)
 elapsed = int(sys.argv[2])
 first = next((l for l in plain.splitlines() if l.strip()), "")
+first_ansi = next((l for l in raw.splitlines() if "Heading One" in re.sub(r"\x1b\[[0-9;]*m", "", l)), "")
 checks = {
     "table_corner": "┌" in plain,
     "table_vline": "│" in plain,
     "heading": "Heading One" in plain,
     "heading_icon": ("Heading One" in first and not first.lstrip().startswith("#")),
+    # non-cursor heading look: RenderMarkdownH1Bg must survive capture
+    "heading_bg": "48;2;" in first_ansi,
     "mermaid_diagram": ("Start" in plain and "Done" in plain and "┌" in plain),
     "no_eob_pad": "quote" in (plain.splitlines()[-1] if plain.splitlines() else ""),
     # cold LazyVim dump target from design (~2s); allow slack on busy hosts
