@@ -5,6 +5,7 @@ local M = {}
 ---@field width? integer
 ---@field timeout_ms? integer
 ---@field max_lines? integer
+---@field compose? boolean
 ---@field install_cli? boolean
 ---@field disable_plugins? string[]
 
@@ -15,6 +16,7 @@ local DEFAULTS = {
   -- width: nil → NVIMCAT_WIDTH / COLUMNS / vim.o.columns (see prepare_chrome)
   timeout_ms = 8000,
   max_lines = 5000,
+  compose = false,
   install_cli = true,
   disable_plugins = {
     "copilot.lua",
@@ -117,14 +119,15 @@ end
 
 local function ensure_lazy_markdown_plugins()
   pcall(function()
-    require("lazy").load({
+    require("lazy.core.loader").load({
       plugins = {
         "render-markdown.nvim",
         "render-markdown-mermaid.nvim",
       },
-    })
+    }, { start = "nvimcat" })
   end)
   pcall(vim.cmd, "doautocmd FileType " .. (vim.bo.filetype ~= "" and vim.bo.filetype or "markdown"))
+  return pcall(require, "render-markdown.core.ui")
 end
 
 local plugins_loaded = false
@@ -149,8 +152,7 @@ local ts_parsed = false
 
 local function try_force_render(buf, win, need_mermaid)
   if not plugins_loaded then
-    ensure_lazy_markdown_plugins()
-    plugins_loaded = true
+    plugins_loaded = ensure_lazy_markdown_plugins()
   end
   pcall(function()
     vim.wo[win].conceallevel = 2
@@ -560,6 +562,15 @@ function M.dump(opts)
   vim.g.nvimcat_rows = estimate_height(buf)
   vim.g.nvimcat_buf_lines = vim.api.nvim_buf_line_count(buf)
 
+  if opts.compose or vim.env.NVIMCAT_COMPOSE == "1" then
+    vim.g.nvimcat_compose = 1
+    vim.g.nvimcat_capture = 1
+    if vim.env.NVIMCAT_VERBOSE == "1" then
+      io.stderr:write("nvimcat: compose=1\n")
+    end
+    return ""
+  end
+
   if vim.env.NVIMCAT_EMBED == "1" then
     -- Embed client owns ANSI; next UI flush is the frame to emit.
     vim.g.nvimcat_capture = 1
@@ -621,6 +632,7 @@ end
 --- Run cb once Lazy/Vim is ready (no fixed 2s sleep).
 local function when_ready(cb)
   local done = false
+  local compose = vim.env.NVIMCAT_COMPOSE == "1"
   local function once()
     if done then
       return
@@ -653,7 +665,7 @@ local function when_ready(cb)
     vim.defer_fn(once, 700)
   end
 
-  if vim.v.vim_did_enter == 1 then
+  if compose or vim.v.vim_did_enter == 1 then
     poll_from_vimenter()
   else
     vim.api.nvim_create_autocmd("VimEnter", {

@@ -730,7 +730,11 @@ class NvimEmbed:
             self._stdin.close()
         except OSError:
             pass
-        self._proc.wait(timeout=5)
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.terminate()
+            self._proc.wait(timeout=5)
 
 
 # Neovim clamps UI height (&lines) at 1000. Above that, try_resize is futile and
@@ -758,10 +762,10 @@ def _estimate_rows(paths: list[str]) -> int:
     return _PAGE_LINES
 
 
-def _nvim_argv(root: str) -> list[str]:
+def _nvim_argv(root: str, nvim_bin: str | None = None) -> list[str]:
     root_esc = root.replace("\\", "\\\\").replace("'", "\\'")
     return [
-        "nvim",
+        nvim_bin or os.environ.get("NVIMCAT_NVIM_BIN", "nvim"),
         "--embed",
         "-n",
         "--cmd",
@@ -826,6 +830,45 @@ return {
     }
 
 
+def _compose_load_plugins(nv: "NvimEmbed", timeout: float) -> None:
+    nv.request(
+        "nvim_exec_lua",
+        """
+local ok = pcall(require, "lazy")
+if ok then
+  local loader_ok, loader = pcall(require, "lazy.core.loader")
+  if loader_ok then
+    pcall(loader.load, {
+      plugins = {
+        "render-markdown.nvim",
+        "render-markdown-mermaid.nvim",
+      },
+    }, { start = "nvimcat-compose" })
+  end
+  pcall(vim.cmd, "doautocmd FileType " .. (vim.bo.filetype ~= "" and vim.bo.filetype or "markdown"))
+end
+local width = tonumber(vim.env.NVIMCAT_WIDTH)
+if width then
+  vim.o.columns = width
+end
+pcall(function()
+  vim.wo[vim.api.nvim_get_current_win()].conceallevel = 2
+  vim.wo[vim.api.nvim_get_current_win()].concealcursor = ""
+end)
+local ok_ui, ui = pcall(require, "render-markdown.core.ui")
+if ok_ui then
+  pcall(function() require("render-markdown").set(true) end)
+  pcall(ui.update, vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win(),
+    "nvimcat-compose", true)
+  vim.cmd("redraw!")
+end
+return ok_ui
+""",
+        [],
+        timeout=timeout,
+    )
+
+
 def _scroll_page(nv: "NvimEmbed", next_top: int, timeout: float) -> None:
     """Scroll so topline=next_top and force a render-markdown update for the new viewport."""
     nv.request(
@@ -835,10 +878,15 @@ local top = {int(next_top)}
 local win = vim.api.nvim_get_current_win()
 local buf = vim.api.nvim_get_current_buf()
 vim.fn.winrestview({{ lnum = top, col = 0, topline = top, leftcol = 0 }})
-local decorator = require("render-markdown.core.ui").get(buf)
+local ok, ui = pcall(require, "render-markdown.core.ui")
+if not ok then
+  vim.cmd("redraw!")
+  return
+end
+local decorator = ui.get(buf)
 local before = decorator.n
 pcall(function()
-  require("render-markdown.core.ui").update(buf, win, "nvimcat-page", true)
+  ui.update(buf, win, "nvimcat-page", true)
 end)
 -- Wait for this page's parse, not stale extmarks from the previous page.
 vim.wait(200, function()
@@ -851,7 +899,166 @@ vim.cmd("redraw!")
     )
 
 
+_COMPOSE_BUFFER_LINES = 250
+_COMPOSE_MAX_ROWS = 1000
+
+
+def _compose_sgr(attrs: dict[str, Any], *, reset: bool) -> bytes:
+    attrs = dict(attrs)
+    fg = attrs.get("foreground")
+    bg = attrs.get("background")
+    if attrs.get("reverse"):
+        fg, bg = bg, fg
+
+    parts: list[str] = ["0"] if reset else []
+    for key, code in (
+        ("bold", "1"),
+        ("dim", "2"),
+        ("italic", "3"),
+        ("underline", "4"),
+        ("undercurl", "4"),
+        ("strikethrough", "9"),
+        ("standout", "7"),
+    ):
+        if attrs.get(key):
+            parts.append(code)
+    if fg is not None:
+        color = int(fg)
+        parts.append(f"38;2;{(color >> 16) & 0xFF};{(color >> 8) & 0xFF};{color & 0xFF}")
+    if bg is not None:
+        color = int(bg)
+        parts.append(f"48;2;{(color >> 16) & 0xFF};{(color >> 8) & 0xFF};{color & 0xFF}")
+    return f"\x1b[{';'.join(parts)}m".encode() if parts else b""
+
+
+def _compose_row_to_ansi(row: dict[str, Any]) -> bytes:
+    cells = list(row.get("cells") or [])
+    while cells and cells[-1].get("text") == " " and not cells[-1].get("highlight"):
+        cells.pop()
+
+    out = bytearray()
+    current: dict[str, Any] | None = None
+    emitted = False
+    for cell in cells:
+        attrs = dict(cell.get("highlight") or {})
+        if attrs != current:
+            if current is not None:
+                out.extend(_compose_sgr(attrs, reset=True))
+            else:
+                out.extend(_compose_sgr(attrs, reset=False))
+            current = attrs
+            emitted = emitted or bool(attrs)
+        text = cell.get("text") or ""
+        out.extend(str(text).encode("utf-8"))
+    if emitted:
+        out.extend(b"\x1b[0m")
+    return bytes(out)
+
+
+def _compose_rows_to_ansi(rows: list[Any]) -> bytes:
+    lines = [_compose_row_to_ansi(row) for row in rows if isinstance(row, dict)]
+    return b"\n".join(lines) + (b"\n" if lines else b"")
+
+
+def _capture_composed(width: int, files: list[str]) -> int | None:
+    """Stream bounded compose-API ranges, or return None if the API is unavailable."""
+    root = os.environ.get("NVIMCAT_ROOT") or str(_ROOT)
+    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "60"))
+    env = os.environ.copy()
+    env["NVIMCAT"] = "1"
+    env["NVIMCAT_ROOT"] = root
+    env["NVIMCAT_WIDTH"] = str(width)
+    env["NVIMCAT_COMPOSE"] = "1"
+    env["NVIMCAT_EMBED"] = "1"
+    env["NVIMCAT_FILES"] = "\x1e".join(files) + ("\x1e" if files else "")
+
+    nvim_bin = env.get("NVIMCAT_NVIM_BIN", "nvim")
+    nv = NvimEmbed(argv=_nvim_argv(root, nvim_bin), env=env)
+    deadline = time.time() + timeout
+    wrote_any = False
+    rc = 1
+    try:
+        try:
+            nv.ui_attach(width, _COMPOSE_BUFFER_LINES)
+            nv.request("nvim_ui_detach")
+            nv.request("nvim_command", f"luafile {root}/scripts/cli-entry.lua")
+        except (TimeoutError, RuntimeError) as exc:
+            print(f"nvimcat: compose unavailable, falling back: {exc}", file=sys.stderr)
+            return None
+        while time.time() < deadline:
+            if nv._proc.poll() is not None:
+                return None if not wrote_any else 1
+
+            try:
+                done = nv.request("nvim_get_var", "nvimcat_done", timeout=0.5)
+            except (TimeoutError, RuntimeError):
+                done = 0
+            if done == 1:
+                rc = 0
+                break
+
+            try:
+                capture = nv.request("nvim_get_var", "nvimcat_capture", timeout=0.5)
+            except (TimeoutError, RuntimeError):
+                continue
+            if capture != 1:
+                continue
+
+            try:
+                _compose_load_plugins(nv, max(1.0, deadline - time.time()))
+                line_count = int(nv.request("nvim_buf_line_count", 0, timeout=1))
+                file_started = False
+                for start in range(0, max(line_count, 1), _COMPOSE_BUFFER_LINES):
+                    end = min(line_count, start + _COMPOSE_BUFFER_LINES)
+                    _scroll_page(nv, start + 1, max(1.0, deadline - time.time()))
+                    rows = nv.request(
+                        "nvim_win_get_screen_lines",
+                        0,
+                        {
+                            "start_row": start,
+                            "end_row": end,
+                            "width": width,
+                            "max_rows": _COMPOSE_MAX_ROWS,
+                        },
+                        timeout=max(1.0, deadline - time.time()),
+                    )
+                    if not isinstance(rows, list):
+                        raise RuntimeError("compose API returned a non-array result")
+                    chunk = _compose_rows_to_ansi(rows)
+                    if not chunk:
+                        continue
+                    if wrote_any and not file_started:
+                        sys.stdout.buffer.write(b"\n")
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                    wrote_any = True
+                    file_started = True
+                nv.request("nvim_set_var", "nvimcat_capture", 0, timeout=1)
+            except BrokenPipeError:
+                try:
+                    nv.request("nvim_set_var", "nvimcat_capture", 0, timeout=1)
+                except (TimeoutError, RuntimeError):
+                    pass
+                return 0
+            except (TimeoutError, RuntimeError) as exc:
+                if wrote_any:
+                    print(f"nvimcat: compose failed after output: {exc}", file=sys.stderr)
+                    return 1
+                print(f"nvimcat: compose unavailable, falling back: {exc}", file=sys.stderr)
+                return None
+        else:
+            print("nvimcat: timed out waiting for compose capture", file=sys.stderr)
+    finally:
+        nv.close()
+    return rc
+
+
 def capture(width: int, files: list[str]) -> int:
+    if os.environ.get("NVIMCAT_COMPOSE") == "1":
+        composed = _capture_composed(width, files)
+        if composed is not None:
+            return composed
+
     root = os.environ.get("NVIMCAT_ROOT") or str(_ROOT)
     height = _estimate_rows(files)
     timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "60"))
@@ -1058,6 +1265,10 @@ def main(argv: list[str] | None = None) -> int:
         width = int(argv[1]) if len(argv) > 1 else _detect_width()
         return smoke(width)
 
+    if argv and argv[0] == "--compose":
+        os.environ["NVIMCAT_COMPOSE"] = "1"
+        argv = argv[1:]
+
     # Legacy: WIDTH file... (old nvimcat-embed argv)
     if len(argv) >= 2 and argv[0].isdigit() and not Path(argv[0]).exists():
         width = int(argv[0])
@@ -1066,7 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
         return capture(width, files)
 
     if not argv:
-        print("usage: nvimcat [--width N] <file>...", file=sys.stderr)
+        print("usage: nvimcat [--compose] [--width N] <file>...", file=sys.stderr)
         print("       nvimcat --smoke [WIDTH]", file=sys.stderr)
         print("       nvimcat --shot2ansi [screenshot]", file=sys.stderr)
         return 2
