@@ -740,9 +740,16 @@ class NvimEmbed:
 # Neovim clamps UI height (&lines) at 1000. Above that, try_resize is futile and
 # truncates output unless we scroll-stitch pages.
 _UI_MAX_LINES = 1000
-# Dense pipe-tables scale poorly with viewport height in render-markdown; 250 is a
-# decent wall-clock tradeoff vs round-trips (see perf notes on tall files).
-_PAGE_LINES = 250
+# Paint floor for tall-file stitch (grow per segment). NVIMCAT_PAGE_LINES must not
+# control paint height — use NVIMCAT_STITCH_HEIGHT for experiments.
+_STITCH_UI_HEIGHT = 100
+
+
+def _stitch_ui_height() -> int:
+    raw = os.environ.get("NVIMCAT_STITCH_HEIGHT", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return max(24, min(_UI_MAX_LINES, int(raw)))
+    return _STITCH_UI_HEIGHT
 
 
 def _is_soft_break_line(line: str, leaders: list[tuple[str, bool]]) -> bool:
@@ -792,6 +799,25 @@ def _soft_break_segments(
     return out
 
 
+def _fetch_comment_leaders(nv: "NvimEmbed", timeout: float) -> list[tuple[str, bool]]:
+    raw = nv.request(
+        "nvim_exec_lua",
+        """
+local ok, sb = pcall(require, "nvimcat.soft_break")
+if not ok then return {} end
+return sb.line_comment_leaders()
+""",
+        [],
+        timeout=timeout,
+    )
+    out: list[tuple[str, bool]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and item.get("leader"):
+                out.append((str(item["leader"]), bool(item.get("blank_required"))))
+    return out
+
+
 def _estimate_rows(paths: list[str]) -> int:
     total = 0
     for path in paths:
@@ -805,8 +831,8 @@ def _estimate_rows(paths: list[str]) -> int:
     want = total + 32
     if want <= _UI_MAX_LINES:
         return max(24, want)
-    # Tall files: fixed page height; capture() scrolls until EOF.
-    return _PAGE_LINES
+    # Tall files: stitch floor; capture() grows per soft-break segment.
+    return _stitch_ui_height()
 
 
 def _nvim_argv(root: str, nvim_bin: str | None = None) -> list[str]:
@@ -875,6 +901,70 @@ return {
         "bot": int(info.get("bot") or 1),
         "last": int(info.get("last") or 1),
     }
+
+
+def _trim_page_overlap(prev: bytes, nxt: bytes) -> bytes:
+    """Drop leading lines of nxt that duplicate the tail of prev (stale-grid stitch)."""
+    if not prev or not nxt:
+        return nxt
+    prev_lines = prev.split(b"\n")
+    nxt_lines = nxt.split(b"\n")
+    if prev_lines and prev_lines[-1] == b"":
+        prev_lines = prev_lines[:-1]
+    trailing_nl = nxt.endswith(b"\n")
+    if nxt_lines and nxt_lines[-1] == b"":
+        nxt_lines = nxt_lines[:-1]
+
+    def key(line: bytes) -> bytes:
+        return SGR.sub(b"", line).rstrip()
+
+    max_check = min(len(prev_lines), len(nxt_lines), 80)
+    for overlap in range(max_check, 0, -1):
+        if [key(x) for x in prev_lines[-overlap:]] == [key(x) for x in nxt_lines[:overlap]]:
+            nxt_lines = nxt_lines[overlap:]
+            break
+    if not nxt_lines:
+        return b""
+    body = b"\n".join(nxt_lines)
+    return body + (b"\n" if trailing_nl else b"")
+
+
+def _wait_grid_change(
+    nv: "NvimEmbed",
+    grid: Grid,
+    grid_lock: threading.Lock,
+    flush_ev: threading.Event,
+    before: bytes,
+    *,
+    deadline: float,
+    want_top: int | None = None,
+    max_wait: float = 0.5,
+) -> bytes:
+    """Wait until grid ANSI changes from `before` and stays stable across flushes."""
+    page_deadline = min(deadline, time.time() + max_wait)
+    latest = before
+    stable = 0
+    while time.time() < page_deadline:
+        flush_ev.wait(timeout=min(0.05, max(0.0, page_deadline - time.time())))
+        flush_ev.clear()
+        if want_top is not None:
+            try:
+                cur = _win_page_info(nv, max(0.0, deadline - time.time()))
+            except (TimeoutError, RuntimeError):
+                continue
+            if cur["top"] < want_top:
+                continue
+        with grid_lock:
+            now = grid.to_ansi()
+        if now != before and now == latest:
+            stable += 1
+            if stable >= 2:
+                return now
+        else:
+            stable = 0
+        latest = now
+    with grid_lock:
+        return grid.to_ansi()
 
 
 def _compose_load_plugins(nv: "NvimEmbed", timeout: float) -> None:
@@ -1208,47 +1298,108 @@ def capture(width: int, files: list[str]) -> int:
             ):
                 flush_ev.clear()
                 try:
+                    with grid_lock:
+                        before_top = grid.to_ansi()
                     _scroll_page(nv, 1, max(0.0, deadline - time.time()))
-                    flush_ev.wait(timeout=min(2.0, max(0.0, deadline - time.time())))
+                    _wait_grid_change(
+                        nv,
+                        grid,
+                        grid_lock,
+                        flush_ev,
+                        before_top,
+                        deadline=deadline,
+                    )
                 except (TimeoutError, RuntimeError) as exc:
                     print(f"nvimcat: scroll-to-top failed: {exc}", file=sys.stderr)
                 flush_ev.clear()
 
-            # Capture current viewport, then scroll until EOF (or single page).
-            while time.time() < deadline:
-                with grid_lock:
-                    part = grid.to_ansi()
-                if output_parts:
-                    output_parts.append(b"\n")
-                output_parts.append(part)
-                pages_done += 1
-                awaiting_resize_flush = False
+            # Soft-break segments: grow paint to fit each segment, scroll to seg.start.
+            buf_text: list[str] = []
+            try:
+                raw_lines = nv.request(
+                    "nvim_buf_get_lines",
+                    0,
+                    0,
+                    -1,
+                    True,
+                    timeout=max(1.0, deadline - time.time()),
+                )
+                if isinstance(raw_lines, list):
+                    buf_text = [str(x) for x in raw_lines]
+            except (TimeoutError, RuntimeError):
+                buf_text = []
 
-                try:
-                    info = _win_page_info(nv, max(0.0, deadline - time.time()))
-                    page_info_ok = True
-                except (TimeoutError, RuntimeError):
-                    # Do not treat RPC failure as EOF ({bot:1,last:1}).
-                    page_info_ok = False
-                    info = {"top": 1, "bot": 1, "last": 1}
-                if pages_done >= 500:
+            leaders: list[tuple[str, bool]] = []
+            try:
+                leaders = _fetch_comment_leaders(nv, max(1.0, deadline - time.time()))
+            except (TimeoutError, RuntimeError):
+                leaders = []
+
+            stitch_h = _stitch_ui_height()
+            last_line = len(buf_text) if buf_text else int(buf_lines or 1)
+            segments = (
+                _soft_break_segments(buf_text, leaders, ui_max=_UI_MAX_LINES)
+                if buf_text
+                else [(1, last_line)]
+            )
+
+            for seg_start, seg_end in segments:
+                if time.time() >= deadline or pages_done >= 500:
                     break
-                if page_info_ok and info["bot"] >= info["last"]:
-                    break
-                if not page_info_ok:
-                    print("nvimcat: page info failed; stopping stitch", file=sys.stderr)
-                    break
+                block_len = max(1, seg_end - seg_start + 1)
+                page_h = min(_UI_MAX_LINES, max(stitch_h, block_len + 16))
+
+                if page_h != height:
+                    flush_ev.clear()
+                    try:
+                        nv.request(
+                            "nvim_ui_try_resize",
+                            width,
+                            page_h,
+                            timeout=max(0.0, deadline - time.time()),
+                        )
+                        height = page_h
+                        nv.request(
+                            "nvim_command",
+                            "redraw!",
+                            timeout=max(0.0, deadline - time.time()),
+                        )
+                        flush_ev.wait(
+                            timeout=min(1.0, max(0.0, deadline - time.time()))
+                        )
+                    except (TimeoutError, RuntimeError) as exc:
+                        print(f"nvimcat: page resize failed: {exc}", file=sys.stderr)
+                    flush_ev.clear()
 
                 flush_ev.clear()
                 try:
-                    _scroll_page(nv, info["bot"] + 1, max(0.0, deadline - time.time()))
+                    with grid_lock:
+                        before = grid.to_ansi()
+                    _scroll_page(nv, seg_start, max(0.0, deadline - time.time()))
+                    _wait_grid_change(
+                        nv,
+                        grid,
+                        grid_lock,
+                        flush_ev,
+                        before,
+                        deadline=deadline,
+                        max_wait=0.5,
+                    )
                 except (TimeoutError, RuntimeError) as exc:
                     print(f"nvimcat: scroll failed: {exc}", file=sys.stderr)
                     break
-                if not flush_ev.wait(timeout=min(2.0, max(0.0, deadline - time.time()))):
-                    # No flush — still try to capture whatever is on the grid.
-                    pass
                 flush_ev.clear()
+
+                with grid_lock:
+                    part = grid.to_ansi()
+                if output_parts:
+                    part = _trim_page_overlap(output_parts[-1], part)
+                if part:
+                    if output_parts and not output_parts[-1].endswith(b"\n"):
+                        output_parts.append(b"\n")
+                    output_parts.append(part)
+                pages_done += 1
+                awaiting_resize_flush = False
 
             try:
                 nv.request(
