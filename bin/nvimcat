@@ -745,6 +745,53 @@ _UI_MAX_LINES = 1000
 _PAGE_LINES = 250
 
 
+def _is_soft_break_line(line: str, leaders: list[tuple[str, bool]]) -> bool:
+    if not line.strip():
+        return True
+    # strip indent only (keep internal spaces)
+    i = 0
+    while i < len(line) and line[i] in " \t":
+        i += 1
+    body = line[i:]
+    for leader, blank_required in leaders:
+        if not leader or not body.startswith(leader):
+            continue
+        rest = body[len(leader) :]
+        if blank_required:
+            if rest == "" or rest[0] in " \t":
+                return True
+        else:
+            return True
+    return False
+
+
+def _soft_break_segments(
+    lines: list[str],
+    leaders: list[tuple[str, bool]],
+    ui_max: int = 1000,
+) -> list[tuple[int, int]]:
+    """1-based inclusive segments ending on soft break or EOF; hard-cut at ui_max."""
+    n = len(lines)
+    if n == 0:
+        return []
+    out: list[tuple[int, int]] = []
+    start = 1
+    while start <= n:
+        end = start
+        while end <= n:
+            if end - start + 1 >= ui_max:
+                end = start + ui_max - 1
+                break
+            if _is_soft_break_line(lines[end - 1], leaders):
+                break
+            end += 1
+        if end > n:
+            end = n
+        out.append((start, end))
+        start = end + 1
+    return out
+
+
 def _estimate_rows(paths: list[str]) -> int:
     total = 0
     for path in paths:
