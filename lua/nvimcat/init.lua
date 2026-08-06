@@ -476,6 +476,9 @@ function M.dump(opts)
 
   local buf = vim.api.nvim_get_current_buf()
   local win = vim.api.nvim_get_current_win()
+  -- LazyVim BufReadPost last_loc is deferred via lazy file events and can jump
+  -- to the '"' mark after we reset topline=1 — that starts scroll-stitch at EOF.
+  vim.b[buf].lazyvim_last_loc = true
   pcall(function()
     vim.wo[win].number = false
     vim.wo[win].relativenumber = false
@@ -562,7 +565,24 @@ function M.dump(opts)
   vim.g.nvimcat_rows = estimate_height(buf)
   vim.g.nvimcat_buf_lines = vim.api.nvim_buf_line_count(buf)
 
+  local function pin_capture_view()
+    -- Re-pin immediately before capture: deferred last_loc / plugins may have
+    -- moved the cursor after settle; Neovim scrolls to keep cursor visible.
+    vim.b[buf].lazyvim_last_loc = true
+    pcall(vim.api.nvim_win_set_cursor, win, { 1, 0 })
+    pcall(function()
+      vim.fn.winrestview({ lnum = 1, col = 0, topline = 1, leftcol = 0 })
+    end)
+    local before = render_generation(buf)
+    try_force_render(buf, win, need_mermaid)
+    vim.wait(math.min(500, opts.timeout_ms), function()
+      local generation = render_generation(buf)
+      return before == nil or (generation ~= nil and generation > before)
+    end, 20)
+  end
+
   if opts.compose or vim.env.NVIMCAT_COMPOSE == "1" then
+    pin_capture_view()
     vim.g.nvimcat_compose = 1
     vim.g.nvimcat_capture = 1
     if vim.env.NVIMCAT_VERBOSE == "1" then
@@ -573,6 +593,7 @@ function M.dump(opts)
 
   if vim.env.NVIMCAT_EMBED == "1" then
     -- Embed client owns ANSI; next UI flush is the frame to emit.
+    pin_capture_view()
     vim.g.nvimcat_capture = 1
     vim.cmd("redraw!")
     return ""

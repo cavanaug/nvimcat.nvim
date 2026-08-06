@@ -1076,6 +1076,7 @@ def capture(width: int, files: list[str]) -> int:
     awaiting_resize_flush = False
     output_parts: list[bytes] = []
     pages_done = 0
+    buf_lines: int | None = None
 
     def on_notify(method: str, args: list[Any]) -> None:
         if method != "redraw":
@@ -1151,6 +1152,21 @@ def capture(width: int, files: list[str]) -> int:
                     awaiting_resize_flush = True
                     continue
 
+            # Tall buffers: plugins (LazyVim last_loc) may have scrolled to EOF
+            # after Lua pinned topline=1. Force page 1 before stitching.
+            if (
+                pages_done == 0
+                and isinstance(buf_lines, int)
+                and buf_lines > height
+            ):
+                flush_ev.clear()
+                try:
+                    _scroll_page(nv, 1, max(0.0, deadline - time.time()))
+                    flush_ev.wait(timeout=min(2.0, max(0.0, deadline - time.time())))
+                except (TimeoutError, RuntimeError) as exc:
+                    print(f"nvimcat: scroll-to-top failed: {exc}", file=sys.stderr)
+                flush_ev.clear()
+
             # Capture current viewport, then scroll until EOF (or single page).
             while time.time() < deadline:
                 with grid_lock:
@@ -1163,9 +1179,17 @@ def capture(width: int, files: list[str]) -> int:
 
                 try:
                     info = _win_page_info(nv, max(0.0, deadline - time.time()))
+                    page_info_ok = True
                 except (TimeoutError, RuntimeError):
+                    # Do not treat RPC failure as EOF ({bot:1,last:1}).
+                    page_info_ok = False
                     info = {"top": 1, "bot": 1, "last": 1}
-                if info["bot"] >= info["last"] or pages_done >= 500:
+                if pages_done >= 500:
+                    break
+                if page_info_ok and info["bot"] >= info["last"]:
+                    break
+                if not page_info_ok:
+                    print("nvimcat: page info failed; stopping stitch", file=sys.stderr)
                     break
 
                 flush_ev.clear()
