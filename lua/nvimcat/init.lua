@@ -328,6 +328,7 @@ local function mute_lsp_paint(buf)
     pcall(function()
       vim.lsp.semantic_tokens.stop(buf, client.id)
     end)
+    pcall(vim.lsp.stop_client, client.id, false)
   end
   for name, id in pairs(vim.api.nvim_get_namespaces()) do
     if name:find("semantic_tokens", 1, true) then
@@ -383,6 +384,16 @@ end
 local function silence_ui_noise()
   pcall(vim.diagnostic.enable, false)
   pcall(vim.diagnostic.hide)
+  -- lualine refreshes and can restore laststatus between stitch pages.
+  vim.o.laststatus = 0
+  vim.o.showtabline = 0
+  vim.o.cmdheight = 0
+  pcall(function()
+    require("lualine").hide({
+      place = { "statusline", "tabline", "winbar" },
+      unhide = false,
+    })
+  end)
   -- Indent guides / scope lines (│) and cursor-word glow are not part of
   -- the markdown render the user wants to dump.
   pcall(function()

@@ -480,6 +480,19 @@ class Grid:
         text = "".join(ch for ch, _ in row).rstrip()
         return text == "~" or (len(text) > 0 and set(text) <= {"~"})
 
+    @staticmethod
+    def _is_statusline_row(row: list[tuple[str, int]]) -> bool:
+        # lualine / airline leak when laststatus flips back on between stitch pages.
+        text = "".join(ch for ch, _ in row).strip()
+        if not text:
+            return False
+        return bool(
+            re.match(
+                r"^(NORMAL|INSERT|VISUAL|V-BLOCK|V-LINE|REPLACE|COMMAND|TERMINAL)\b",
+                text,
+            )
+        )
+
     def _row_to_ansi(self, row: list[tuple[str, int]]) -> bytes:
         # Keep default-bg padding so blank lines / table tails match the TUI.
         # Only drop trailing spaces when we have no Normal bg to paint.
@@ -514,7 +527,11 @@ class Grid:
             if self._is_eob_row(row):
                 end = i
                 break
-        lines = [self._row_to_ansi(row) for row in rows[:end]]
+        lines = [
+            self._row_to_ansi(row)
+            for row in rows[:end]
+            if not self._is_statusline_row(row)
+        ]
         while lines and lines[-1] in (b"", b"\x1b[0m"):
             lines.pop()
         # Trailing blank buffer lines (no text) — keep; user content may need them.
@@ -903,7 +920,7 @@ return {
     }
 
 
-def _trim_page_overlap(prev: bytes, nxt: bytes) -> bytes:
+def _trim_page_overlap(prev: bytes, nxt: bytes, *, max_overlap: int | None = None) -> bytes:
     """Drop leading lines of nxt that duplicate the tail of prev (stale-grid stitch)."""
     if not prev or not nxt:
         return nxt
@@ -918,7 +935,10 @@ def _trim_page_overlap(prev: bytes, nxt: bytes) -> bytes:
     def key(line: bytes) -> bytes:
         return SGR.sub(b"", line).rstrip()
 
-    max_check = min(len(prev_lines), len(nxt_lines), 80)
+    cap = _UI_MAX_LINES if max_overlap is None else max(0, max_overlap)
+    if cap == 0:
+        return nxt
+    max_check = min(len(prev_lines), len(nxt_lines), cap)
     for overlap in range(max_check, 0, -1):
         if [key(x) for x in prev_lines[-overlap:]] == [key(x) for x in nxt_lines[:overlap]]:
             nxt_lines = nxt_lines[overlap:]
@@ -1015,6 +1035,20 @@ local top = {int(next_top)}
 local win = vim.api.nvim_get_current_win()
 local buf = vim.api.nvim_get_current_buf()
 vim.fn.winrestview({{ lnum = top, col = 0, topline = top, leftcol = 0 }})
+-- LazyVim/lualine can flip laststatus back on between pages; kill chrome each scroll.
+vim.o.laststatus = 0
+vim.o.showtabline = 0
+vim.o.cmdheight = 0
+pcall(function()
+  vim.o.winbar = ""
+  vim.wo[win].winbar = ""
+end)
+for _, client in ipairs(vim.lsp.get_clients()) do
+  pcall(function()
+    client.server_capabilities.semanticTokensProvider = nil
+  end)
+  pcall(vim.lsp.semantic_tokens.stop, buf, client.id)
+end
 local ok, ui = pcall(require, "render-markdown.core.ui")
 if not ok then
   vim.cmd("redraw!")
@@ -1343,6 +1377,8 @@ def capture(width: int, files: list[str]) -> int:
                 else [(1, last_line)]
             )
 
+            prev_seg_start: int | None = None
+            prev_page_h: int | None = None
             for seg_start, seg_end in segments:
                 if time.time() >= deadline or pages_done >= 500:
                     break
@@ -1393,13 +1429,31 @@ def capture(width: int, files: list[str]) -> int:
                 with grid_lock:
                     part = grid.to_ansi()
                 if output_parts:
-                    part = _trim_page_overlap(output_parts[-1], part)
+                    overlap_cap = prev_page_h
+                    if (
+                        prev_seg_start is not None
+                        and prev_page_h is not None
+                    ):
+                        delta = max(0, seg_start - prev_seg_start)
+                        if delta >= prev_page_h:
+                            overlap_cap = 0
+                        else:
+                            slack = min(prev_page_h, max(16, delta * 4))
+                            overlap_cap = min(
+                                prev_page_h,
+                                prev_page_h - delta + slack,
+                            )
+                    part = _trim_page_overlap(
+                        output_parts[-1], part, max_overlap=overlap_cap
+                    )
                 if part:
                     if output_parts and not output_parts[-1].endswith(b"\n"):
                         output_parts.append(b"\n")
                     output_parts.append(part)
                 pages_done += 1
                 awaiting_resize_flush = False
+                prev_seg_start = seg_start
+                prev_page_h = page_h
 
             try:
                 nv.request(
