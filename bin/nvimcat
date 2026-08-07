@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -481,17 +482,55 @@ class Grid:
         return text == "~" or (len(text) > 0 and set(text) <= {"~"})
 
     @staticmethod
-    def _is_statusline_row(row: list[tuple[str, int]]) -> bool:
-        # lualine / airline leak when laststatus flips back on between stitch pages.
-        text = "".join(ch for ch, _ in row).strip()
+    def _plain_row_text(row: list[tuple[str, int]]) -> str:
+        return "".join(ch for ch, _ in row).strip()
+
+    @staticmethod
+    def _is_chrome_text(text: str) -> bool:
         if not text:
             return False
-        return bool(
-            re.match(
-                r"^(NORMAL|INSERT|VISUAL|V-BLOCK|V-LINE|REPLACE|COMMAND|TERMINAL)\b",
-                text,
-            )
-        )
+        if re.match(
+            r"^(NORMAL|INSERT|VISUAL|V-BLOCK|V-LINE|REPLACE|COMMAND|TERMINAL)\b",
+            text,
+        ):
+            return True
+        if "Indexing workspace" in text:
+            return True
+        if "Indexed" in text and "%)" in text:
+            return True
+        return False
+
+    @staticmethod
+    def _is_statusline_row(row: list[tuple[str, int]]) -> bool:
+        # lualine / airline leak when laststatus flips back on between stitch pages.
+        return Grid._is_chrome_text(Grid._plain_row_text(row))
+
+    @staticmethod
+    def _strip_statusline_leak(row: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        text = "".join(ch for ch, _ in row)
+        markers = [
+            text.find("Indexing workspace"),
+            text.find("Indexed"),
+            text.find("rumdl"),
+        ]
+        markers = [m for m in markers if m >= 0]
+        if not markers:
+            return row
+        marker = min(markers)
+        if marker <= 0:
+            return []
+        if any(c in text for c in "├│└┴┬┼"):
+            target = len(text)
+            prefix = text[:marker].rstrip()
+            if len(prefix) < target:
+                prefix += "─" * (target - len(prefix))
+            cleaned = prefix
+        else:
+            cleaned = text[:marker].rstrip()
+            if not cleaned:
+                return []
+        hl = row[-1][1] if row else 0
+        return [(cleaned, hl)]
 
     def _row_to_ansi(self, row: list[tuple[str, int]]) -> bytes:
         # Keep default-bg padding so blank lines / table tails match the TUI.
@@ -527,13 +566,22 @@ class Grid:
             if self._is_eob_row(row):
                 end = i
                 break
-        lines = [
-            self._row_to_ansi(row)
-            for row in rows[:end]
-            if not self._is_statusline_row(row)
-        ]
+        lines = []
+        for row in rows[:end]:
+            if self._is_statusline_row(row):
+                continue
+            row = self._strip_statusline_leak(row)
+            if not row:
+                continue
+            lines.append(self._row_to_ansi(row))
         while lines and lines[-1] in (b"", b"\x1b[0m"):
             lines.pop()
+        while lines:
+            plain = SGR.sub(b"", lines[-1]).decode("utf-8", "replace").strip()
+            if plain and self._is_chrome_text(plain):
+                lines.pop()
+                continue
+            break
         # Trailing blank buffer lines (no text) — keep; user content may need them.
         return b"\n".join(lines) + (b"\n" if lines else b"")
 
@@ -671,6 +719,8 @@ class NvimEmbed:
             stderr=subprocess.DEVNULL,
             env=env,
             bufsize=0,
+            # If this Python dies (timeout / agent interrupt), nvim must die too.
+            preexec_fn=_nvim_child_setup,
         )
         assert self._proc.stdin and self._proc.stdout
         self._stdin = self._proc.stdin
@@ -743,15 +793,42 @@ class NvimEmbed:
         self.request("nvim_ui_attach", width, height, opts)
 
     def close(self) -> None:
+        proc = self._proc
+        if proc.poll() is not None:
+            return
         try:
             self._stdin.close()
         except OSError:
             pass
         try:
-            self._proc.wait(timeout=5)
+            proc.wait(timeout=2)
+            return
         except subprocess.TimeoutExpired:
-            self._proc.terminate()
-            self._proc.wait(timeout=5)
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _nvim_child_setup() -> None:
+    """Linux: die when parent nvimcat dies (agent interrupt / outer timeout)."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # PR_SET_PDEATHSIG = 1
+        libc.prctl(1, signal.SIGTERM)
+    except Exception:
+        pass
+    # Also leave the parent's process group so `timeout(1)` group kills work.
 
 
 # Neovim clamps UI height (&lines) at 1000. Above that, try_resize is futile and
@@ -920,7 +997,13 @@ return {
     }
 
 
-def _trim_page_overlap(prev: bytes, nxt: bytes, *, max_overlap: int | None = None) -> bytes:
+def _trim_page_overlap(
+    prev: bytes,
+    nxt: bytes,
+    *,
+    max_overlap: int | None = None,
+    fallback_trim: int = 0,
+) -> bytes:
     """Drop leading lines of nxt that duplicate the tail of prev (stale-grid stitch)."""
     if not prev or not nxt:
         return nxt
@@ -939,10 +1022,14 @@ def _trim_page_overlap(prev: bytes, nxt: bytes, *, max_overlap: int | None = Non
     if cap == 0:
         return nxt
     max_check = min(len(prev_lines), len(nxt_lines), cap)
+    matched = False
     for overlap in range(max_check, 0, -1):
         if [key(x) for x in prev_lines[-overlap:]] == [key(x) for x in nxt_lines[:overlap]]:
             nxt_lines = nxt_lines[overlap:]
+            matched = True
             break
+    if not matched and fallback_trim > 0:
+        nxt_lines = nxt_lines[min(len(nxt_lines), fallback_trim) :]
     if not nxt_lines:
         return b""
     body = b"\n".join(nxt_lines)
@@ -1026,6 +1113,57 @@ return ok_ui
     )
 
 
+_SILENCE_CHROME_LUA = """
+local win = vim.api.nvim_get_current_win()
+vim.o.laststatus = 0
+vim.o.showtabline = 0
+vim.o.cmdheight = 0
+pcall(function()
+  vim.o.winbar = ""
+  vim.wo[win].winbar = ""
+end)
+pcall(function()
+  require("lualine").hide({
+    place = { "statusline", "tabline", "winbar" },
+    unhide = false,
+  })
+end)
+"""
+
+_PRE_STITCH_RENDER_LUA = """
+local buf = vim.api.nvim_get_current_buf()
+local win = vim.api.nvim_get_current_win()
+local ok, ui = pcall(require, "render-markdown.core.ui")
+if not ok then
+  vim.cmd("redraw!")
+  return
+end
+pcall(function() require("render-markdown").set(true) end)
+local decorator = ui.get(buf)
+local before = decorator.n
+pcall(function()
+  ui.update(buf, win, "nvimcat-pre-stitch", true)
+end)
+local stable = 0
+local last = before
+vim.wait(5000, function()
+  if decorator.running then
+    stable = 0
+    return false
+  end
+  local now = decorator.n
+  if now > before and now == last then
+    stable = stable + 1
+    return stable >= 5
+  end
+  last = now
+  stable = 0
+  return false
+end, 25)
+vim.cmd("redraw!")
+"""
+
+
 def _scroll_page(nv: "NvimEmbed", next_top: int, timeout: float) -> None:
     """Scroll so topline=next_top and force a render-markdown update for the new viewport."""
     nv.request(
@@ -1034,20 +1172,12 @@ def _scroll_page(nv: "NvimEmbed", next_top: int, timeout: float) -> None:
 local top = {int(next_top)}
 local win = vim.api.nvim_get_current_win()
 local buf = vim.api.nvim_get_current_buf()
+local view = vim.fn.winsaveview()
 vim.fn.winrestview({{ lnum = top, col = 0, topline = top, leftcol = 0 }})
--- LazyVim/lualine can flip laststatus back on between pages; kill chrome each scroll.
-vim.o.laststatus = 0
-vim.o.showtabline = 0
-vim.o.cmdheight = 0
-pcall(function()
-  vim.o.winbar = ""
-  vim.wo[win].winbar = ""
-end)
-for _, client in ipairs(vim.lsp.get_clients()) do
-  pcall(function()
-    client.server_capabilities.semanticTokensProvider = nil
-  end)
-  pcall(vim.lsp.semantic_tokens.stop, buf, client.id)
+{_SILENCE_CHROME_LUA}
+if (view.topline or 1) == top then
+  vim.cmd("redraw!")
+  return
 end
 local ok, ui = pcall(require, "render-markdown.core.ui")
 if not ok then
@@ -1059,10 +1189,23 @@ local before = decorator.n
 pcall(function()
   ui.update(buf, win, "nvimcat-page", true)
 end)
--- Wait for this page's parse, not stale extmarks from the previous page.
-vim.wait(200, function()
-  return decorator.n > before
-end, 10)
+-- Wait for this page's parse to finish, not just bump decorator.n once.
+local last = before
+local stable = 0
+vim.wait(3000, function()
+  if decorator.running then
+    stable = 0
+    return false
+  end
+  local now = decorator.n
+  if now > before and now == last then
+    stable = stable + 1
+    return stable >= 3
+  end
+  last = now
+  stable = 0
+  return false
+end, 20)
 vim.cmd("redraw!")
 """,
         [],
@@ -1134,6 +1277,8 @@ def _compose_rows_to_ansi(rows: list[Any]) -> bytes:
 def _capture_composed(width: int, files: list[str]) -> int | None:
     """Stream bounded compose-API ranges, or return None if the API is unavailable."""
     root = os.environ.get("NVIMCAT_ROOT") or str(_ROOT)
+    if not (Path(root) / "lua" / "nvimcat").is_dir():
+        root = str(_ROOT)
     timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "60"))
     env = os.environ.copy()
     env["NVIMCAT"] = "1"
@@ -1231,6 +1376,9 @@ def capture(width: int, files: list[str]) -> int:
             return composed
 
     root = os.environ.get("NVIMCAT_ROOT") or str(_ROOT)
+    # Guard against a poisoned NVIMCAT_ROOT=/ (seen in orphan embeds).
+    if not (Path(root) / "lua" / "nvimcat").is_dir():
+        root = str(_ROOT)
     height = _estimate_rows(files)
     timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "60"))
 
@@ -1347,6 +1495,21 @@ def capture(width: int, files: list[str]) -> int:
                     print(f"nvimcat: scroll-to-top failed: {exc}", file=sys.stderr)
                 flush_ev.clear()
 
+            if pages_done == 0:
+                try:
+                    nv.request(
+                        "nvim_exec_lua",
+                        _PRE_STITCH_RENDER_LUA,
+                        [],
+                        timeout=max(1.0, deadline - time.time()),
+                    )
+                    flush_ev.wait(
+                        timeout=min(1.0, max(0.0, deadline - time.time()))
+                    )
+                except (TimeoutError, RuntimeError) as exc:
+                    print(f"nvimcat: pre-stitch render failed: {exc}", file=sys.stderr)
+                flush_ev.clear()
+
             # Soft-break segments: grow paint to fit each segment, scroll to seg.start.
             buf_text: list[str] = []
             try:
@@ -1430,6 +1593,7 @@ def capture(width: int, files: list[str]) -> int:
                     part = grid.to_ansi()
                 if output_parts:
                     overlap_cap = prev_page_h
+                    fallback_trim = 0
                     if (
                         prev_seg_start is not None
                         and prev_page_h is not None
@@ -1438,13 +1602,18 @@ def capture(width: int, files: list[str]) -> int:
                         if delta >= prev_page_h:
                             overlap_cap = 0
                         else:
+                            # ponytail: +16 virt/chrome slack only; paint floor skews page_h.
+                            fallback_trim = min(16, prev_page_h - delta)
                             slack = min(prev_page_h, max(16, delta * 4))
                             overlap_cap = min(
                                 prev_page_h,
                                 prev_page_h - delta + slack,
                             )
                     part = _trim_page_overlap(
-                        output_parts[-1], part, max_overlap=overlap_cap
+                        output_parts[-1],
+                        part,
+                        max_overlap=overlap_cap,
+                        fallback_trim=fallback_trim,
                     )
                 if part:
                     if output_parts and not output_parts[-1].endswith(b"\n"):
