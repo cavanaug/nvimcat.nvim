@@ -179,7 +179,7 @@ Worth preserving / reviewing before rewriting dump path:
 - Settle: force once, then poll (no per-tick `try_force_render` thrash).
 - Treesitter parse once; mermaid only if needed.
 - Disable `nvim-lint`; stop all LSP on attach (rumdl was leaking into grid).
-- Cap UI rows at 1000; scroll-stitch at `_PAGE_LINES = 250` in `bin/nvimcat`.
+- Cap UI rows at 1000; scroll-stitch at `_PAGE_LINES` default **100** in `bin/nvimcat` (empirical; override with `NVIMCAT_PAGE_LINES`).
 - `scripts/check-scroll-stitch.sh` — tall buffer completeness check.
 - Timing: `NVIMCAT_TIMING=1` → `/tmp/nvimcat-timing.log`.
 

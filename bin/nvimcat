@@ -441,6 +441,59 @@ class Grid:
         self._width.pop(grid, None)
         self._height.pop(grid, None)
 
+    def apply_grid_scroll(
+        self,
+        grid: int,
+        top: int,
+        bot: int,
+        left: int,
+        right: int,
+        rows: int,
+        cols: int,
+    ) -> None:
+        """Copy screen cells for ui-event-grid_scroll (end-exclusive region)."""
+        if cols != 0 or grid not in self._width:
+            return
+        width = self._width[grid]
+        grid_rows = self._rows.setdefault(grid, [])
+        while len(grid_rows) < bot:
+            grid_rows.append([(" ", 0)] * width)
+        left = max(0, left)
+        right = min(right, width)
+        if right <= left or bot <= top or rows == 0:
+            return
+
+        def copy_row(src: int, dst: int) -> None:
+            src_line = list(grid_rows[src])
+            if len(src_line) < width:
+                src_line.extend([(" ", 0)] * (width - len(src_line)))
+            dst_line = list(grid_rows[dst])
+            if len(dst_line) < width:
+                dst_line.extend([(" ", 0)] * (width - len(dst_line)))
+            dst_line[left:right] = src_line[left:right]
+            grid_rows[dst] = dst_line
+
+        def clear_row(row: int) -> None:
+            line = list(grid_rows[row])
+            if len(line) < width:
+                line.extend([(" ", 0)] * (width - len(line)))
+            line[left:right] = [(" ", 0)] * (right - left)
+            grid_rows[row] = line
+
+        if rows > 0:
+            # Move SR content up (scroll down in the buffer).
+            for row in range(top, bot - rows):
+                copy_row(row + rows, row)
+            for row in range(max(bot - rows, top), bot):
+                clear_row(row)
+        else:
+            # Move SR content down (scroll up in the buffer).
+            amount = -rows
+            for row in range(bot - 1, top + amount - 1, -1):
+                copy_row(row - amount, row)
+            for row in range(top, min(top + amount, bot)):
+                clear_row(row)
+
     def _resolve(self, hl_id: int) -> dict[str, Any]:
         """Neovim: missing rgb attrs inherit Normal (default_colors_set)."""
         attrs: dict[str, Any] = {}
@@ -480,6 +533,19 @@ class Grid:
         text = "".join(ch for ch, _ in row).rstrip()
         return text == "~" or (len(text) > 0 and set(text) <= {"~"})
 
+    @staticmethod
+    def _is_statusline_row(row: list[tuple[str, int]]) -> bool:
+        # lualine / airline leak when laststatus flips back on between stitch pages.
+        text = "".join(ch for ch, _ in row).strip()
+        if not text:
+            return False
+        return bool(
+            re.match(
+                r"^(NORMAL|INSERT|VISUAL|V-BLOCK|V-LINE|REPLACE|COMMAND|TERMINAL)\b",
+                text,
+            )
+        )
+
     def _row_to_ansi(self, row: list[tuple[str, int]]) -> bytes:
         # Keep default-bg padding so blank lines / table tails match the TUI.
         # Only drop trailing spaces when we have no Normal bg to paint.
@@ -487,6 +553,16 @@ class Grid:
         if self._default_bg is None:
             while trimmed and trimmed[-1][0] == " " and trimmed[-1][1] == 0:
                 trimmed.pop()
+        # Drop winbar/status overlays that sometimes paint into the last
+        # viewport row at page boundaries (seen as trailing "✔ Index").
+        plain = "".join(ch for ch, _ in trimmed)
+        for junk in ("✔ Index", "✓ Index"):
+            idx = plain.rfind(junk)
+            if idx != -1 and plain[idx:].strip() == junk:
+                trimmed = trimmed[:idx]
+                while trimmed and trimmed[-1][0] == " ":
+                    trimmed.pop()
+                break
         out = bytearray()
         cur_hl: int | None = None
         buf = bytearray()
@@ -506,7 +582,7 @@ class Grid:
             out.extend(b"\x1b[0m")
         return bytes(out)
 
-    def to_ansi(self, grid: int = 1) -> bytes:
+    def to_ansi(self, grid: int = 1, max_rows: int | None = None) -> bytes:
         rows = self._rows.get(grid, [])
         # Drop end-of-buffer `~` rows and anything below (status/cmdline chrome).
         end = len(rows)
@@ -514,7 +590,13 @@ class Grid:
             if self._is_eob_row(row):
                 end = i
                 break
-        lines = [self._row_to_ansi(row) for row in rows[:end]]
+        if max_rows is not None and max_rows > 0:
+            end = min(end, max_rows)
+        lines = [
+            self._row_to_ansi(row)
+            for row in rows[:end]
+            if not self._is_statusline_row(row)
+        ]
         while lines and lines[-1] in (b"", b"\x1b[0m"):
             lines.pop()
         # Trailing blank buffer lines (no text) — keep; user content may need them.
@@ -740,9 +822,17 @@ class NvimEmbed:
 # Neovim clamps UI height (&lines) at 1000. Above that, try_resize is futile and
 # truncates output unless we scroll-stitch pages.
 _UI_MAX_LINES = 1000
-# Dense pipe-tables scale poorly with viewport height in render-markdown; 250 is a
-# decent wall-clock tradeoff vs round-trips (see perf notes on tall files).
-_PAGE_LINES = 250
+# Canonical viewport for tall-file stitch. MUST stay fixed across runs — changing
+# paint height changes render-markdown layout and breaks output identity.
+# Perf experiments: NVIMCAT_STITCH_HEIGHT (not NVIMCAT_PAGE_LINES).
+_STITCH_UI_HEIGHT = 100
+
+
+def _stitch_ui_height() -> int:
+    raw = os.environ.get("NVIMCAT_STITCH_HEIGHT", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return max(24, min(_UI_MAX_LINES, int(raw)))
+    return _STITCH_UI_HEIGHT
 
 
 def _estimate_rows(paths: list[str]) -> int:
@@ -758,8 +848,49 @@ def _estimate_rows(paths: list[str]) -> int:
     want = total + 32
     if want <= _UI_MAX_LINES:
         return max(24, want)
-    # Tall files: fixed page height; capture() scrolls until EOF.
-    return _PAGE_LINES
+    # Tall files: canonical stitch height (content-aware capture resizes per block).
+    return _stitch_ui_height()
+
+
+def _is_table_line(line: str) -> bool:
+    s = line.lstrip()
+    return s.startswith("|") or (s.startswith(":") and "|" in s)
+
+
+def _content_block_end(lines: list[str], start: int) -> int:
+    """Inclusive 1-based end of the markdown block containing `start`."""
+    n = len(lines)
+    if start < 1 or start > n:
+        return max(1, min(start, n))
+    i = start - 1
+    line = lines[i]
+
+    if _is_table_line(line):
+        j = i
+        while j < n and _is_table_line(lines[j]):
+            j += 1
+        return j  # j is exclusive 0-based → inclusive 1-based end
+
+    stripped = line.strip()
+    if stripped.startswith("```"):
+        j = i + 1
+        while j < n and not lines[j].strip().startswith("```"):
+            j += 1
+        return min(j + 1, n) if j < n else n
+
+    if stripped.startswith("#"):
+        return start
+
+    # Paragraph / list: through next blank or structural boundary.
+    j = i + 1
+    while j < n:
+        s = lines[j].strip()
+        if not s:
+            break
+        if s.startswith("#") or s.startswith("```") or _is_table_line(lines[j]):
+            break
+        j += 1
+    return j  # exclusive 0-based j → inclusive 1-based last content line is j
 
 
 def _nvim_argv(root: str, nvim_bin: str | None = None) -> list[str]:
@@ -799,11 +930,86 @@ def _apply_redraw(grid: Grid, events: list[Any]) -> bool:
                 grid.apply_grid_clear(int(item[0]))
             elif name == "grid_destroy" and isinstance(item, list) and item:
                 grid.apply_grid_destroy(int(item[0]))
+            elif name == "grid_scroll" and isinstance(item, list) and len(item) >= 7:
+                grid.apply_grid_scroll(
+                    int(item[0]),
+                    int(item[1]),
+                    int(item[2]),
+                    int(item[3]),
+                    int(item[4]),
+                    int(item[5]),
+                    int(item[6]),
+                )
             elif name == "hl_attr_define" and isinstance(item, list) and len(item) >= 4:
                 grid.apply_hl_attr_define(int(item[0]), item[1], item[2], item[3])
             elif name == "default_colors_set" and isinstance(item, list) and len(item) >= 2:
                 grid.apply_default_colors_set(*item[:5])
     return flushed
+
+
+def _trim_page_overlap(prev: bytes, nxt: bytes) -> bytes:
+    """Drop leading lines of nxt that duplicate the tail of prev (stale-grid stitch)."""
+    if not prev or not nxt:
+        return nxt
+    prev_lines = prev.split(b"\n")
+    nxt_lines = nxt.split(b"\n")
+    if prev_lines and prev_lines[-1] == b"":
+        prev_lines = prev_lines[:-1]
+    trailing_nl = nxt.endswith(b"\n")
+    if nxt_lines and nxt_lines[-1] == b"":
+        nxt_lines = nxt_lines[:-1]
+
+    def key(line: bytes) -> bytes:
+        # Compare without SGR / trailing spaces — page chrome can tweak attrs.
+        return SGR.sub(b"", line).rstrip()
+
+    max_check = min(len(prev_lines), len(nxt_lines), 80)
+    for overlap in range(max_check, 0, -1):
+        if [key(x) for x in prev_lines[-overlap:]] == [key(x) for x in nxt_lines[:overlap]]:
+            nxt_lines = nxt_lines[overlap:]
+            break
+    if not nxt_lines:
+        return b""
+    body = b"\n".join(nxt_lines)
+    return body + (b"\n" if trailing_nl else b"")
+
+
+def _wait_grid_change(
+    nv: "NvimEmbed",
+    grid: Grid,
+    grid_lock: threading.Lock,
+    flush_ev: threading.Event,
+    before: bytes,
+    *,
+    deadline: float,
+    want_top: int | None = None,
+    max_wait: float = 0.5,
+) -> bytes:
+    """Wait until grid ANSI changes from `before` and stays stable across flushes."""
+    page_deadline = min(deadline, time.time() + max_wait)
+    latest = before
+    stable = 0
+    while time.time() < page_deadline:
+        flush_ev.wait(timeout=min(0.05, max(0.0, page_deadline - time.time())))
+        flush_ev.clear()
+        if want_top is not None:
+            try:
+                cur = _win_page_info(nv, max(0.0, deadline - time.time()))
+            except (TimeoutError, RuntimeError):
+                continue
+            if cur["top"] < want_top:
+                continue
+        with grid_lock:
+            now = grid.to_ansi()
+        if now != before and now == latest:
+            stable += 1
+            if stable >= 2:
+                return now
+        else:
+            stable = 0
+        latest = now
+    with grid_lock:
+        return grid.to_ansi()
 
 
 def _win_page_info(nv: "NvimEmbed", timeout: float) -> dict[str, int]:
@@ -812,21 +1018,24 @@ def _win_page_info(nv: "NvimEmbed", timeout: float) -> dict[str, int]:
         "nvim_exec_lua",
         """
 local view = vim.fn.winsaveview()
+local win = vim.api.nvim_get_current_win()
 return {
   top = view.topline or 1,
   bot = vim.fn.line('w$'),
   last = vim.fn.line('$'),
+  height = vim.api.nvim_win_get_height(win),
 }
 """,
         [],
         timeout=timeout,
     )
     if not isinstance(info, dict):
-        return {"top": 1, "bot": 1, "last": 1}
+        return {"top": 1, "bot": 1, "last": 1, "height": 0}
     return {
         "top": int(info.get("top") or 1),
         "bot": int(info.get("bot") or 1),
         "last": int(info.get("last") or 1),
+        "height": int(info.get("height") or 0),
     }
 
 
@@ -878,6 +1087,14 @@ local top = {int(next_top)}
 local win = vim.api.nvim_get_current_win()
 local buf = vim.api.nvim_get_current_buf()
 vim.fn.winrestview({{ lnum = top, col = 0, topline = top, leftcol = 0 }})
+-- LazyVim/lualine can flip laststatus back on between pages; kill chrome each scroll.
+vim.o.laststatus = 0
+vim.o.showtabline = 0
+vim.o.cmdheight = 0
+pcall(function()
+  vim.o.winbar = ""
+  vim.wo[win].winbar = ""
+end)
 local ok, ui = pcall(require, "render-markdown.core.ui")
 if not ok then
   vim.cmd("redraw!")
@@ -1161,47 +1378,122 @@ def capture(width: int, files: list[str]) -> int:
             ):
                 flush_ev.clear()
                 try:
+                    with grid_lock:
+                        before_top = grid.to_ansi()
                     _scroll_page(nv, 1, max(0.0, deadline - time.time()))
-                    flush_ev.wait(timeout=min(2.0, max(0.0, deadline - time.time())))
+                    _wait_grid_change(
+                        nv,
+                        grid,
+                        grid_lock,
+                        flush_ev,
+                        before_top,
+                        deadline=deadline,
+                    )
                 except (TimeoutError, RuntimeError) as exc:
                     print(f"nvimcat: scroll-to-top failed: {exc}", file=sys.stderr)
                 flush_ev.clear()
 
-            # Capture current viewport, then scroll until EOF (or single page).
-            while time.time() < deadline:
+            # Content-aware stitch: grow the viewport to fit each markdown block
+            # (table/fence) when possible so we do not cut mid-table. Paint height
+            # never follows NVIMCAT_PAGE_LINES — only NVIMCAT_STITCH_HEIGHT / default.
+            buf_text: list[str] = []
+            try:
+                raw_lines = nv.request(
+                    "nvim_buf_get_lines",
+                    0,
+                    0,
+                    -1,
+                    True,
+                    timeout=max(1.0, deadline - time.time()),
+                )
+                if isinstance(raw_lines, list):
+                    buf_text = [str(x) for x in raw_lines]
+            except (TimeoutError, RuntimeError):
+                buf_text = []
+
+            stitch_h = _stitch_ui_height()
+            topline = 1
+            last_line = len(buf_text) if buf_text else int(buf_lines or 1)
+
+            while time.time() < deadline and topline <= last_line and pages_done < 500:
+                if buf_text:
+                    block_end = _content_block_end(buf_text, topline)
+                    block_len = max(1, block_end - topline + 1)
+                else:
+                    block_end = last_line
+                    block_len = last_line - topline + 1
+
+                if stitch_h < block_len <= _UI_MAX_LINES:
+                    # Grow to fit a whole mid-size block (avoid mid-table cuts).
+                    page_h = min(_UI_MAX_LINES, int(block_len * 1.25) + 16)
+                else:
+                    page_h = stitch_h
+
+                if page_h != height:
+                    flush_ev.clear()
+                    try:
+                        nv.request(
+                            "nvim_ui_try_resize",
+                            width,
+                            page_h,
+                            timeout=max(0.0, deadline - time.time()),
+                        )
+                        height = page_h
+                        nv.request(
+                            "nvim_command",
+                            "redraw!",
+                            timeout=max(0.0, deadline - time.time()),
+                        )
+                        flush_ev.wait(
+                            timeout=min(1.0, max(0.0, deadline - time.time()))
+                        )
+                    except (TimeoutError, RuntimeError) as exc:
+                        print(f"nvimcat: page resize failed: {exc}", file=sys.stderr)
+                    flush_ev.clear()
+
+                flush_ev.clear()
+                try:
+                    with grid_lock:
+                        before = grid.to_ansi()
+                    _scroll_page(nv, topline, max(0.0, deadline - time.time()))
+                    _wait_grid_change(
+                        nv,
+                        grid,
+                        grid_lock,
+                        flush_ev,
+                        before,
+                        deadline=deadline,
+                        max_wait=0.5,
+                    )
+                except (TimeoutError, RuntimeError) as exc:
+                    print(f"nvimcat: scroll failed: {exc}", file=sys.stderr)
+                    break
+                flush_ev.clear()
+
                 with grid_lock:
                     part = grid.to_ansi()
                 if output_parts:
-                    output_parts.append(b"\n")
-                output_parts.append(part)
+                    part = _trim_page_overlap(output_parts[-1], part)
+                if part:
+                    if output_parts and not output_parts[-1].endswith(b"\n"):
+                        output_parts.append(b"\n")
+                    output_parts.append(part)
                 pages_done += 1
                 awaiting_resize_flush = False
 
                 try:
                     info = _win_page_info(nv, max(0.0, deadline - time.time()))
-                    page_info_ok = True
                 except (TimeoutError, RuntimeError):
-                    # Do not treat RPC failure as EOF ({bot:1,last:1}).
-                    page_info_ok = False
-                    info = {"top": 1, "bot": 1, "last": 1}
-                if pages_done >= 500:
-                    break
-                if page_info_ok and info["bot"] >= info["last"]:
-                    break
-                if not page_info_ok:
-                    print("nvimcat: page info failed; stopping stitch", file=sys.stderr)
+                    info = {"top": topline, "bot": topline, "last": last_line}
+
+                if info["bot"] >= info["last"]:
                     break
 
-                flush_ev.clear()
-                try:
-                    _scroll_page(nv, info["bot"] + 1, max(0.0, deadline - time.time()))
-                except (TimeoutError, RuntimeError) as exc:
-                    print(f"nvimcat: scroll failed: {exc}", file=sys.stderr)
-                    break
-                if not flush_ev.wait(timeout=min(2.0, max(0.0, deadline - time.time()))):
-                    # No flush — still try to capture whatever is on the grid.
-                    pass
-                flush_ev.clear()
+                # Always advance by painted buffer coverage (not block_end alone),
+                # otherwise small tables re-capture nearly the same viewport.
+                topline = info["bot"] + 1
+                if topline <= info["top"]:
+                    topline = info["top"] + 1
 
             try:
                 nv.request(

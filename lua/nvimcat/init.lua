@@ -150,7 +150,19 @@ end
 
 local ts_parsed = false
 
+local function wants_render_markdown(buf)
+  local ft = vim.bo[buf].filetype
+  return ft == "markdown"
+    or ft == "markdown.mdx"
+    or ft == "mdx"
+    or ft == "quarto"
+    or ft == "rmd"
+end
+
 local function try_force_render(buf, win, need_mermaid)
+  if not wants_render_markdown(buf) then
+    return
+  end
   if not plugins_loaded then
     plugins_loaded = ensure_lazy_markdown_plugins()
   end
@@ -248,6 +260,10 @@ local function has_rm_marks(buf)
 end
 
 local function is_ready(buf, need_mermaid)
+  -- Non-markdown: nothing for render-markdown to paint — do not burn timeout_ms.
+  if not wants_render_markdown(buf) then
+    return true
+  end
   -- Mermaid is async (bm); when the fence exists, wait for its virt_lines.
   if need_mermaid then
     return has_mermaid_decor(buf)
@@ -264,6 +280,10 @@ local function render_generation(buf)
 end
 
 local function settle(buf, win, opts, need_mermaid)
+  -- Non-markdown: no render-markdown work — do not wait for a generation bump.
+  if not wants_render_markdown(buf) then
+    return true
+  end
   -- Force once, then only poll. Re-forcing every tick (debounce=0) schedules
   -- unbounded ui.update callbacks and can prevent decorations from stabilizing.
   local before = render_generation(buf)
@@ -383,6 +403,16 @@ end
 local function silence_ui_noise()
   pcall(vim.diagnostic.enable, false)
   pcall(vim.diagnostic.hide)
+  -- lualine refreshes and can restore laststatus between stitch pages.
+  vim.o.laststatus = 0
+  vim.o.showtabline = 0
+  vim.o.cmdheight = 0
+  pcall(function()
+    require("lualine").hide({
+      place = { "statusline", "tabline", "winbar" },
+      unhide = false,
+    })
+  end)
   -- Indent guides / scope lines (│) and cursor-word glow are not part of
   -- the markdown render the user wants to dump.
   pcall(function()
@@ -518,13 +548,15 @@ function M.dump(opts)
   end)
   -- winrestview changes the visible range after settle; refresh decorations
   -- for the restored first page before the capture client snapshots the grid.
-  local before_view_render = render_generation(buf)
-  try_force_render(buf, win, need_mermaid)
-  vim.wait(math.min(500, opts.timeout_ms), function()
-    local generation = render_generation(buf)
-    return before_view_render == nil
-      or (generation ~= nil and generation > before_view_render)
-  end, 20)
+  if wants_render_markdown(buf) then
+    local before_view_render = render_generation(buf)
+    try_force_render(buf, win, need_mermaid)
+    vim.wait(math.min(500, opts.timeout_ms), function()
+      local generation = render_generation(buf)
+      return before_view_render == nil
+        or (generation ~= nil and generation > before_view_render)
+    end, 20)
+  end
   -- Re-assert chrome: LazyVim/lualine may flip laststatus back on.
   vim.o.laststatus = 0
   vim.o.showtabline = 0
@@ -573,12 +605,14 @@ function M.dump(opts)
     pcall(function()
       vim.fn.winrestview({ lnum = 1, col = 0, topline = 1, leftcol = 0 })
     end)
-    local before = render_generation(buf)
-    try_force_render(buf, win, need_mermaid)
-    vim.wait(math.min(500, opts.timeout_ms), function()
-      local generation = render_generation(buf)
-      return before == nil or (generation ~= nil and generation > before)
-    end, 20)
+    if wants_render_markdown(buf) then
+      local before = render_generation(buf)
+      try_force_render(buf, win, need_mermaid)
+      vim.wait(math.min(500, opts.timeout_ms), function()
+        local generation = render_generation(buf)
+        return before == nil or (generation ~= nil and generation > before)
+      end, 20)
+    end
   end
 
   if opts.compose or vim.env.NVIMCAT_COMPOSE == "1" then
