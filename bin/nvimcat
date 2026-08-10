@@ -494,9 +494,8 @@ class Grid:
             text,
         ):
             return True
-        if "Indexing workspace" in text:
-            return True
-        if "Indexed" in text and "%)" in text:
+        # Whole-row indexer toast (not a table line — those are mid-row stripped).
+        if re.search(r"Index(?:ing|ed)\b", text) and not text.lstrip().startswith("│"):
             return True
         return False
 
@@ -507,16 +506,18 @@ class Grid:
 
     @staticmethod
     def _strip_statusline_leak(row: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        """Cut rumdl/snacks Indexing/Indexed overlays that paint mid-row.
+
+        Overlays garble to forms like '✔tIndexingiworkspace' or
+        'adIndexedo1/630nfiles' — match Indexing|Indexed, not only the phrase.
+        Mid-cell garble is still nondeterministic after truncate; prefer
+        silencing the indexer. This is a safety net for leftover paint.
+        """
         text = "".join(ch for ch, _ in row)
-        markers = [
-            text.find("Indexing workspace"),
-            text.find("Indexed"),
-            text.find("rumdl"),
-        ]
-        markers = [m for m in markers if m >= 0]
-        if not markers:
+        m = re.search(r"✔[^│\n]{0,40}Index|Index(?:ing|ed)|rumdl", text)
+        if not m:
             return row
-        marker = min(markers)
+        marker = m.start()
         if marker <= 0:
             return []
         if any(c in text for c in "├│└┴┬┼"):
@@ -846,6 +847,19 @@ def _stitch_ui_height() -> int:
     return _STITCH_UI_HEIGHT
 
 
+# Scroll Lua does vim.wait(3000); a collapsing remaining-budget of 0–1s
+# yields flaky "RPC timeout: nvim_exec_lua" mid-stitch on large files.
+_PAGE_RPC_FLOOR = 8.0
+
+
+def _page_rpc_timeout(deadline: float, floor: float = _PAGE_RPC_FLOOR) -> float:
+    rem = deadline - time.time()
+    if rem <= 0:
+        raise TimeoutError("capture deadline exhausted")
+    # Floor lets an in-flight page finish when overall budget is nearly gone.
+    return max(floor, rem)
+
+
 def _is_soft_break_line(line: str, leaders: list[tuple[str, bool]]) -> bool:
     if not line.strip():
         return True
@@ -1097,7 +1111,7 @@ if width then
 end
 pcall(function()
   vim.wo[vim.api.nvim_get_current_win()].conceallevel = 2
-  vim.wo[vim.api.nvim_get_current_win()].concealcursor = ""
+  vim.wo[vim.api.nvim_get_current_win()].concealcursor = "nvic"
 end)
 local ok_ui, ui = pcall(require, "render-markdown.core.ui")
 if ok_ui then
@@ -1115,9 +1129,25 @@ return ok_ui
 
 _SILENCE_CHROME_LUA = """
 local win = vim.api.nvim_get_current_win()
+local buf = vim.api.nvim_get_current_buf()
 vim.o.laststatus = 0
 vim.o.showtabline = 0
 vim.o.cmdheight = 0
+-- Stitch parks cursor on topline; keep links concealed (not anti-conceal raw).
+vim.wo[win].conceallevel = 2
+vim.wo[win].concealcursor = "nvic"
+pcall(function()
+  local state = require("render-markdown.state")
+  local function disable(cfg)
+    if not cfg then return end
+    if cfg.anti_conceal then cfg.anti_conceal.enabled = false end
+    cfg.win_options = cfg.win_options or {}
+    cfg.win_options.concealcursor = cfg.win_options.concealcursor or {}
+    cfg.win_options.concealcursor.rendered = "nvic"
+  end
+  disable(state.config)
+  for _, cfg in pairs(state.cache or {}) do disable(cfg) end
+end)
 pcall(function()
   vim.o.winbar = ""
   vim.wo[win].winbar = ""
@@ -1128,6 +1158,38 @@ pcall(function()
     unhide = false,
   })
 end)
+pcall(function()
+  require("snacks").notifier.hide()
+end)
+pcall(function()
+  require("noice").disable()
+end)
+pcall(function()
+  local opts = require("noice.config").options
+  if opts and opts.lsp and opts.lsp.progress then
+    opts.lsp.progress.enabled = false
+  end
+end)
+for _, client in ipairs(vim.lsp.get_clients()) do
+  local name = tostring(client.name or ""):lower()
+  if name:find("rumdl", 1, true) then
+    pcall(vim.lsp.stop_client, client.id, true)
+  end
+end
+for _, w in ipairs(vim.api.nvim_list_wins()) do
+  local ok, cfg = pcall(vim.api.nvim_win_get_config, w)
+  if ok and cfg.relative ~= nil and cfg.relative ~= "" then
+    pcall(vim.api.nvim_win_close, w, true)
+  end
+end
+for name, id in pairs(vim.api.nvim_get_namespaces()) do
+  local n = tostring(name):lower()
+  if n:find("rumdl", 1, true) or n:find("notifier", 1, true)
+    or n:find("notify", 1, true) or n:find("snacks", 1, true)
+    or n:find("noice", 1, true) then
+    pcall(vim.api.nvim_buf_clear_namespace, buf, id, 0, -1)
+  end
+end
 """
 
 _PRE_STITCH_RENDER_LUA = """
@@ -1279,7 +1341,7 @@ def _capture_composed(width: int, files: list[str]) -> int | None:
     root = os.environ.get("NVIMCAT_ROOT") or str(_ROOT)
     if not (Path(root) / "lua" / "nvimcat").is_dir():
         root = str(_ROOT)
-    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "60"))
+    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "180"))
     env = os.environ.copy()
     env["NVIMCAT"] = "1"
     env["NVIMCAT_ROOT"] = root
@@ -1380,7 +1442,7 @@ def capture(width: int, files: list[str]) -> int:
     if not (Path(root) / "lua" / "nvimcat").is_dir():
         root = str(_ROOT)
     height = _estimate_rows(files)
-    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "60"))
+    timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "180"))
 
     env = os.environ.copy()
     env["NVIMCAT"] = "1"
@@ -1482,7 +1544,7 @@ def capture(width: int, files: list[str]) -> int:
                 try:
                     with grid_lock:
                         before_top = grid.to_ansi()
-                    _scroll_page(nv, 1, max(0.0, deadline - time.time()))
+                    _scroll_page(nv, 1, _page_rpc_timeout(deadline))
                     _wait_grid_change(
                         nv,
                         grid,
@@ -1501,7 +1563,7 @@ def capture(width: int, files: list[str]) -> int:
                         "nvim_exec_lua",
                         _PRE_STITCH_RENDER_LUA,
                         [],
-                        timeout=max(1.0, deadline - time.time()),
+                        timeout=_page_rpc_timeout(deadline),
                     )
                     flush_ev.wait(
                         timeout=min(1.0, max(0.0, deadline - time.time()))
@@ -1519,7 +1581,7 @@ def capture(width: int, files: list[str]) -> int:
                     0,
                     -1,
                     True,
-                    timeout=max(1.0, deadline - time.time()),
+                    timeout=_page_rpc_timeout(deadline),
                 )
                 if isinstance(raw_lines, list):
                     buf_text = [str(x) for x in raw_lines]
@@ -1528,7 +1590,7 @@ def capture(width: int, files: list[str]) -> int:
 
             leaders: list[tuple[str, bool]] = []
             try:
-                leaders = _fetch_comment_leaders(nv, max(1.0, deadline - time.time()))
+                leaders = _fetch_comment_leaders(nv, _page_rpc_timeout(deadline))
             except (TimeoutError, RuntimeError):
                 leaders = []
 
@@ -1542,8 +1604,10 @@ def capture(width: int, files: list[str]) -> int:
 
             prev_seg_start: int | None = None
             prev_page_h: int | None = None
+            stitch_ok = True
             for seg_start, seg_end in segments:
                 if time.time() >= deadline or pages_done >= 500:
+                    stitch_ok = False
                     break
                 block_len = max(1, seg_end - seg_start + 1)
                 page_h = min(_UI_MAX_LINES, max(stitch_h, block_len + 16))
@@ -1555,26 +1619,28 @@ def capture(width: int, files: list[str]) -> int:
                             "nvim_ui_try_resize",
                             width,
                             page_h,
-                            timeout=max(0.0, deadline - time.time()),
+                            timeout=_page_rpc_timeout(deadline),
                         )
                         height = page_h
                         nv.request(
                             "nvim_command",
                             "redraw!",
-                            timeout=max(0.0, deadline - time.time()),
+                            timeout=_page_rpc_timeout(deadline),
                         )
                         flush_ev.wait(
                             timeout=min(1.0, max(0.0, deadline - time.time()))
                         )
                     except (TimeoutError, RuntimeError) as exc:
                         print(f"nvimcat: page resize failed: {exc}", file=sys.stderr)
+                        stitch_ok = False
+                        break
                     flush_ev.clear()
 
                 flush_ev.clear()
                 try:
                     with grid_lock:
                         before = grid.to_ansi()
-                    _scroll_page(nv, seg_start, max(0.0, deadline - time.time()))
+                    _scroll_page(nv, seg_start, _page_rpc_timeout(deadline))
                     _wait_grid_change(
                         nv,
                         grid,
@@ -1586,6 +1652,7 @@ def capture(width: int, files: list[str]) -> int:
                     )
                 except (TimeoutError, RuntimeError) as exc:
                     print(f"nvimcat: scroll failed: {exc}", file=sys.stderr)
+                    stitch_ok = False
                     break
                 flush_ev.clear()
 
@@ -1624,12 +1691,23 @@ def capture(width: int, files: list[str]) -> int:
                 prev_seg_start = seg_start
                 prev_page_h = page_h
 
+            if not stitch_ok or pages_done < len(segments):
+                print(
+                    f"nvimcat: stitch incomplete pages={pages_done}/{len(segments)}",
+                    file=sys.stderr,
+                )
+                try:
+                    nv.request("nvim_set_var", "nvimcat_capture", 0, timeout=5)
+                except (TimeoutError, RuntimeError):
+                    pass
+                break
+
             try:
                 nv.request(
                     "nvim_set_var",
                     "nvimcat_capture",
                     0,
-                    timeout=max(0.0, deadline - time.time()),
+                    timeout=_page_rpc_timeout(deadline, floor=1.0),
                 )
             except (TimeoutError, RuntimeError):
                 pass
