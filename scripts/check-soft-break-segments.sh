@@ -2,18 +2,12 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 python3 - "$ROOT" <<'PY'
-import importlib.util
 import sys
 from pathlib import Path
+import types
 
 root = Path(sys.argv[1])
-# bin/nvimcat is a script; load via runpy-safe path: exec only defs by importing as file
-sys.path.insert(0, str(root / "bin"))
-# Prefer loading functions by compiling the file and extracting — script has side effects on __main__.
-# Instead: duplicate-import guard — call helpers after loading with a stub __name__.
-import types
 code = (root / "bin" / "nvimcat").read_text()
-# Execute module body without running main: strip/avoid __main__ by setting __name__
 ns = types.ModuleType("nvimcat_bin")
 ns.__file__ = str(root / "bin" / "nvimcat")
 exec(compile(code, str(root / "bin" / "nvimcat"), "exec"), ns.__dict__)
@@ -21,7 +15,7 @@ exec(compile(code, str(root / "bin" / "nvimcat"), "exec"), ns.__dict__)
 seg = ns._soft_break_segments
 is_sb = ns._is_soft_break_line
 
-# blanks only
+# blanks: pack to last soft break in pack_target window
 lines = ["a", "b", "", "c"]
 assert seg(lines, []) == [(1, 3), (4, 4)], seg(lines, [])
 
@@ -29,7 +23,7 @@ assert seg(lines, []) == [(1, 3), (4, 4)], seg(lines, [])
 leaders = [("#", True)]
 lines = ["code", "# note", "more"]
 assert is_sb("# note", leaders)
-assert not is_sb("#note", leaders)  # b-flag: need blank after leader
+assert not is_sb("#note", leaders)
 assert not is_sb("code", leaders)
 assert seg(lines, leaders) == [(1, 2), (3, 3)], seg(lines, leaders)
 
@@ -42,32 +36,49 @@ assert is_sb("//", leaders)
 lines = ["a", "b", "c", "d", "e"]
 assert seg(lines, [], ui_max=2) == [(1, 2), (3, 4), (5, 5)], seg(lines, [], ui_max=2)
 
-# soft break ends segment including the blank
+# multiple blanks within pack_target: pack to last blank
 lines = ["a", "", "b", ""]
-assert seg(lines, []) == [(1, 2), (3, 4)], seg(lines, [])
+assert seg(lines, [], pack_target=100) == [(1, 4)], seg(lines, [], pack_target=100)
 
 # extra break (heading) without blank
 lines = ["a", "## H", "b"]
-assert seg(lines, [], extra_breaks={2}) == [(1, 2), (3, 3)]
+assert seg(lines, [], extra_breaks={2}) == [(1, 2), (3, 3)], seg(lines, [], extra_breaks={2})
 
-# blank suppressed inside fence range
+# fence: interior blank suppressed; trailing blank is cut
 lines = ["```", "", "x", "```", ""]
-# suppress interior blanks: lines 2..3 (after open, before close) — blank at 2 ignored
 assert seg(
-    lines, [], extra_breaks={1}, suppress_blanks=[(2, 3)]
-) == [(1, 1), (2, 5)]
-# explanation: seg1 ends at fence open (1); seg2 runs 2..5 including trailing blank soft break at 5
+    lines, [], extra_breaks={1}, suppress_blanks=[(2, 3)], pack_target=100
+) == [(1, 5)], seg(lines, [], extra_breaks={1}, suppress_blanks=[(2, 3)], pack_target=100)
 
-# blank outside suppress still breaks
+# blank outside suppress still preferred cut
 lines = ["a", "", "b"]
-assert seg(lines, [], suppress_blanks=[(10, 12)]) == [(1, 2), (3, 3)]
+assert seg(lines, [], suppress_blanks=[(10, 12)]) == [(1, 2), (3, 3)], seg(lines, [])
 
-# comment still breaks even inside suppress
+# comment still preferred cut even inside suppress range
 leaders = [("#", True)]
 lines = ["```", "# note", "```"]
 assert seg(
     lines, leaders, extra_breaks={1}, suppress_blanks=[(2, 2)]
-) == [(1, 1), (2, 2), (3, 3)]
+) == [(1, 2), (3, 3)], seg(lines, leaders, extra_breaks={1}, suppress_blanks=[(2, 2)])
+
+# many headings: pack_target keeps page count sane (not one page per heading)
+lines = []
+extras = set()
+for i in range(1, 51):
+    lines.append(f"## H{i}")
+    extras.add(len(lines))
+    lines.append(f"body-{i}")
+    lines.append("")
+packed = seg(lines, [], ui_max=1000, pack_target=100, extra_breaks=extras)
+assert 2 <= len(packed) <= 8, packed
+for a, b in packed:
+    assert b - a + 1 <= 1000
+
+# no soft break in pack_target → hard-cut at pack_limit (not distant blank)
+lines = ["x"] * 50 + [""] + ["y"] * 50 + [""]
+packed = seg(lines, [], pack_target=40)
+assert packed[0] == (1, 40), packed
+assert packed[1][0] == 41
 
 print("OK soft-break-segments")
 PY

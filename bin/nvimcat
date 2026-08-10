@@ -904,20 +904,26 @@ def _soft_break_segments(
     ui_max: int = 1000,
     extra_breaks: set[int] | frozenset[int] | None = None,
     suppress_blanks: list[tuple[int, int]] | None = None,
+    pack_target: int | None = None,
 ) -> list[tuple[int, int]]:
-    """1-based inclusive segments ending on soft break or EOF; hard-cut at ui_max."""
+    """1-based inclusive segments; soft breaks preferred inside pack_target.
+
+    Each segment is one viewport. Pack to pack_target (default stitch floor):
+    cut at the last soft break in that window; if none, hard-cut at pack_target
+    (not ui_max — extending to the next distant blank under-captures tall files).
+    Never exceed ui_max.
+    """
     breaks = set(extra_breaks) if extra_breaks else None
     n = len(lines)
     if n == 0:
         return []
+    target = pack_target if pack_target is not None else _STITCH_UI_HEIGHT
+    target = max(24, min(ui_max, int(target)))
     out: list[tuple[int, int]] = []
     start = 1
-    while start <= n:
-        end = start
-        while end <= n:
-            if end - start + 1 >= ui_max:
-                end = start + ui_max - 1
-                break
+
+    def last_soft(lo: int, hi: int) -> int | None:
+        for end in range(hi, lo, -1):
             if _is_soft_break_line(
                 lines[end - 1],
                 leaders,
@@ -925,12 +931,17 @@ def _soft_break_segments(
                 extra_breaks=breaks,
                 suppress_blanks=suppress_blanks,
             ):
-                break
-            end += 1
-        if end > n:
-            end = n
-        out.append((start, end))
-        start = end + 1
+                return end
+        return None
+
+    while start <= n:
+        hard_limit = min(n, start + ui_max - 1)
+        pack_limit = min(hard_limit, start + target - 1)
+        cut = last_soft(start, pack_limit)
+        if cut is None:
+            cut = pack_limit
+        out.append((start, cut))
+        start = cut + 1
     return out
 
 
