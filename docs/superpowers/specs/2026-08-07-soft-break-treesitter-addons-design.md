@@ -1,7 +1,7 @@
 # Soft-break treesitter addons — design addendum
 
 **Date:** 2026-08-07  
-**Status:** approved (approach + design sections LGTM; awaiting spec file review)  
+**Status:** implemented (commits 03dc4d1..afbe1ab)  
 **Parent:** [2026-08-06-soft-break-stitch-design.md](./2026-08-06-soft-break-stitch-design.md)  
 **Goal:** Keep universal soft breaks (blank + Neovim line-comment leaders), and add **treesitter-discovered** extra seams + blank suppression so markdown (and later filetypes) cut on headings / fence opens without hardcoding prefix tables or resurrecting table/fence stitch heuristics.
 
