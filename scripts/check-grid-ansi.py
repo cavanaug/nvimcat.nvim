@@ -60,4 +60,46 @@ g.apply_grid_line(1, 2, 0, [["~", 2]], False)
 out = g.to_ansi()
 assert b"Hi" in out and b"~" not in out
 
+# Mid-row rumdl/snacks "Indexing"/"Indexed" overlay is truncated (garbled form too).
+g = Grid()
+g.resize(1, 40)
+g.apply_hl_attr_define(1, {"foreground": 0xFFFFFF}, {}, {})
+g.apply_grid_line(
+    1,
+    0,
+    0,
+    [["│ conta✔tIndexingiworkspace───────", 1]],
+    False,
+)
+out = g.to_ansi()
+plain = out.decode("utf-8", "replace")
+assert "Indexing" not in plain, plain
+assert "conta" in plain, plain
+
+g = Grid()
+g.resize(1, 50)
+g.apply_hl_attr_define(1, {"foreground": 0xFFFFFF}, {}, {})
+g.apply_grid_line(
+    1,
+    0,
+    0,
+    [["│ scopes                       Indexed 71/630 files  (11%) ⠹──", 1]],
+    False,
+)
+out = g.to_ansi()
+plain = out.decode("utf-8", "replace")
+assert "Indexed" not in plain, plain
+assert "scopes" in plain, plain
+
+# Whole-row Indexing toast is dropped.
+g = Grid()
+g.resize(2, 20)
+g.apply_hl_attr_define(1, {"foreground": 0xFFFFFF}, {}, {})
+g.apply_grid_line(1, 0, 0, [["real content", 1]], False)
+g.apply_grid_line(1, 1, 0, [["✔ Indexing workspace", 1]], False)
+out = g.to_ansi()
+plain = out.decode("utf-8", "replace")
+assert "Indexing" not in plain, plain
+assert "real content" in plain, plain
+
 print("OK grid_ansi")

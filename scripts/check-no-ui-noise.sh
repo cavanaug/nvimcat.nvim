@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 plain = re.sub(r"\x1b\[[0-9;]*m", "", Path(sys.argv[1]).read_text())
-for needle in ("Client marksman quit", "Warning"):
+for needle in ("Client marksman quit", "Warning", "Indexing", "Indexed"):
     if needle in plain:
         raise SystemExit(f"FAIL captured UI noise: {needle}")
 PY

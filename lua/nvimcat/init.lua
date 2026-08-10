@@ -30,6 +30,9 @@ local DEFAULTS = {
     -- Lint/spell on large markdown (cspell via nvim-lint) dwarfs render time.
     "nvim-lint",
     "mason-nvim-lint",
+    -- rumdl $/progress + noice mini view paint "Indexed N/M files" into the grid.
+    "lualine.nvim",
+    "noice.nvim",
   },
 }
 
@@ -168,7 +171,8 @@ local function try_force_render(buf, win, need_mermaid)
   end
   pcall(function()
     vim.wo[win].conceallevel = 2
-    vim.wo[win].concealcursor = ""
+    -- Keep concealed markdown on the cursor line (stitch parks lnum=topline).
+    vim.wo[win].concealcursor = "nvic"
   end)
   -- Full-buffer parse once; repeating it every settle poll dominates large files.
   if not ts_parsed then
@@ -329,6 +333,12 @@ local function disable_anti_conceal()
         -- Want non-cursor rendering: hide anti-conceal for the whole dump.
         cfg.anti_conceal.enabled = false
       end
+      -- Default rendered concealcursor is "" (reveal cursor line). With anti
+      -- conceal off, render-markdown's own preset uses "nvic" so links stay
+      -- concealed on the cursor/topline during scroll-stitch.
+      cfg.win_options = cfg.win_options or {}
+      cfg.win_options.concealcursor = cfg.win_options.concealcursor or {}
+      cfg.win_options.concealcursor.rendered = "nvic"
       -- Force updates must not be dropped while decorator.running is true.
       cfg.debounce = 0
     end
@@ -337,9 +347,16 @@ local function disable_anti_conceal()
       disable(cfg)
     end
   end)
+  local win = vim.api.nvim_get_current_win()
+  pcall(function()
+    vim.wo[win].conceallevel = 2
+    vim.wo[win].concealcursor = "nvic"
+  end)
 end
 
---- Silence LSP paint without quitting clients (quit → snacks warning float).
+--- Silence LSP paint without quitting clients that emit snacks quit warnings.
+--- rumdl is force-stopped: its workspace indexer + noice progress overlays
+--- corrupt mid-stitch grid cells nondeterministically.
 local function mute_lsp_paint(buf)
   for _, client in ipairs(vim.lsp.get_clients()) do
     pcall(function()
@@ -348,6 +365,12 @@ local function mute_lsp_paint(buf)
     pcall(function()
       vim.lsp.semantic_tokens.stop(buf, client.id)
     end)
+    local name = tostring(client.name or ""):lower()
+    if name:find("rumdl", 1, true) then
+      pcall(vim.lsp.stop_client, client.id, true)
+    else
+      pcall(vim.lsp.stop_client, client.id, false)
+    end
   end
   for name, id in pairs(vim.api.nvim_get_namespaces()) do
     if name:find("semantic_tokens", 1, true) then
@@ -398,6 +421,16 @@ local function disable_side_effect_plugins(opts)
     require("lint").linters_by_ft = {}
   end)
   pcall(vim.diagnostic.enable, false)
+  -- noice paints rumdl LSP progress ("Indexed N/M files") into the grid.
+  pcall(function()
+    require("noice").disable()
+  end)
+  pcall(function()
+    local opts = require("noice.config").options
+    if opts and opts.lsp and opts.lsp.progress then
+      opts.lsp.progress.enabled = false
+    end
+  end)
 end
 
 local function silence_ui_noise()
@@ -458,8 +491,34 @@ local function silence_ui_noise()
   local buf = vim.api.nvim_get_current_buf()
   for name, id in pairs(vim.api.nvim_get_namespaces()) do
     local n = tostring(name):lower()
-    if n:find("indent", 1, true) or n:find("illumin", 1, true) or n:find("cursorword", 1, true) then
+    if (
+      n:find("indent", 1, true)
+      or n:find("illumin", 1, true)
+      or n:find("cursorword", 1, true)
+      or n:find("rumdl", 1, true)
+      or n:find("notifier", 1, true)
+      or n:find("snacks", 1, true)
+      or n:find("notify", 1, true)
+      or n:find("noice", 1, true)
+    ) then
       pcall(vim.api.nvim_buf_clear_namespace, buf, id, 0, -1)
+    end
+  end
+  -- Kill snacks notifier / progress toasts that overlay "Indexing workspace".
+  pcall(function()
+    require("snacks").notifier.hide()
+  end)
+  pcall(function()
+    vim.g.snacks_animate = false
+  end)
+  pcall(function()
+    require("noice").disable()
+  end)
+  -- Force-stop rumdl if it reattached mid-stitch (workspace indexer).
+  for _, client in ipairs(vim.lsp.get_clients()) do
+    local name = tostring(client.name or ""):lower()
+    if name:find("rumdl", 1, true) then
+      pcall(vim.lsp.stop_client, client.id, true)
     end
   end
 end
@@ -740,6 +799,7 @@ function M.cli()
   disable_side_effect_plugins(config)
   -- Mute LSP paint before it reaches the capture; stopping clients emits a
   -- quit warning that the embedded UI client would capture as document data.
+  -- Still stop: rumdl/snacks "Indexing workspace" re-paints mid-stitch otherwise.
   vim.api.nvim_create_autocmd("LspAttach", {
     group = vim.api.nvim_create_augroup("nvimcat_mute_lsp", { clear = true }),
     callback = function(args)
@@ -748,6 +808,21 @@ function M.cli()
         client.server_capabilities.semanticTokensProvider = nil
       end
       pcall(vim.lsp.semantic_tokens.stop, args.buf, args.data.client_id)
+      local name = client and tostring(client.name or ""):lower() or ""
+      -- rumdl workspace indexer + noice progress corrupt the grid; force-stop.
+      if name:find("rumdl", 1, true) then
+        pcall(vim.lsp.stop_client, args.data.client_id, true)
+      else
+        -- Soft-stop others: hard quit → snacks warning float into the grid.
+        pcall(vim.lsp.stop_client, args.data.client_id, false)
+      end
+      pcall(function()
+        require("snacks").notifier.hide()
+      end)
+      pcall(function()
+        require("noice").disable()
+      end)
+      silence_ui_noise()
     end,
   })
 
