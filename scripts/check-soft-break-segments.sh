@@ -46,5 +46,28 @@ assert seg(lines, [], ui_max=2) == [(1, 2), (3, 4), (5, 5)], seg(lines, [], ui_m
 lines = ["a", "", "b", ""]
 assert seg(lines, []) == [(1, 2), (3, 4)], seg(lines, [])
 
+# extra break (heading) without blank
+lines = ["a", "## H", "b"]
+assert seg(lines, [], extra_breaks={2}) == [(1, 2), (3, 3)]
+
+# blank suppressed inside fence range
+lines = ["```", "", "x", "```", ""]
+# suppress interior blanks: lines 2..3 (after open, before close) — blank at 2 ignored
+assert seg(
+    lines, [], extra_breaks={1}, suppress_blanks=[(2, 3)]
+) == [(1, 1), (2, 5)]
+# explanation: seg1 ends at fence open (1); seg2 runs 2..5 including trailing blank soft break at 5
+
+# blank outside suppress still breaks
+lines = ["a", "", "b"]
+assert seg(lines, [], suppress_blanks=[(10, 12)]) == [(1, 2), (3, 3)]
+
+# comment still breaks even inside suppress
+leaders = [("#", True)]
+lines = ["```", "# note", "```"]
+assert seg(
+    lines, leaders, extra_breaks={1}, suppress_blanks=[(2, 2)]
+) == [(1, 1), (2, 2), (3, 3)]
+
 print("OK soft-break-segments")
 PY

@@ -860,9 +860,27 @@ def _page_rpc_timeout(deadline: float, floor: float = _PAGE_RPC_FLOOR) -> float:
     return max(floor, rem)
 
 
-def _is_soft_break_line(line: str, leaders: list[tuple[str, bool]]) -> bool:
-    if not line.strip():
+def _line_in_ranges(line_1based: int, ranges: list[tuple[int, int]] | None) -> bool:
+    if not ranges:
+        return False
+    for a, b in ranges:
+        if a <= line_1based <= b:
+            return True
+    return False
+
+
+def _is_soft_break_line(
+    line: str,
+    leaders: list[tuple[str, bool]],
+    *,
+    line_no: int = 1,
+    extra_breaks: set[int] | frozenset[int] | None = None,
+    suppress_blanks: list[tuple[int, int]] | None = None,
+) -> bool:
+    if extra_breaks and line_no in extra_breaks:
         return True
+    if not line.strip():
+        return not _line_in_ranges(line_no, suppress_blanks)
     # strip indent only (keep internal spaces)
     i = 0
     while i < len(line) and line[i] in " \t":
@@ -884,8 +902,11 @@ def _soft_break_segments(
     lines: list[str],
     leaders: list[tuple[str, bool]],
     ui_max: int = 1000,
+    extra_breaks: set[int] | frozenset[int] | None = None,
+    suppress_blanks: list[tuple[int, int]] | None = None,
 ) -> list[tuple[int, int]]:
     """1-based inclusive segments ending on soft break or EOF; hard-cut at ui_max."""
+    breaks = set(extra_breaks) if extra_breaks else None
     n = len(lines)
     if n == 0:
         return []
@@ -897,7 +918,13 @@ def _soft_break_segments(
             if end - start + 1 >= ui_max:
                 end = start + ui_max - 1
                 break
-            if _is_soft_break_line(lines[end - 1], leaders):
+            if _is_soft_break_line(
+                lines[end - 1],
+                leaders,
+                line_no=end,
+                extra_breaks=breaks,
+                suppress_blanks=suppress_blanks,
+            ):
                 break
             end += 1
         if end > n:
