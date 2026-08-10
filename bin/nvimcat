@@ -934,23 +934,50 @@ def _soft_break_segments(
     return out
 
 
-def _fetch_comment_leaders(nv: "NvimEmbed", timeout: float) -> list[tuple[str, bool]]:
+def _fetch_soft_break_info(
+    nv: "NvimEmbed", timeout: float
+) -> tuple[list[tuple[str, bool]], set[int], list[tuple[int, int]]]:
     raw = nv.request(
         "nvim_exec_lua",
         """
 local ok, sb = pcall(require, "nvimcat.soft_break")
-if not ok then return {} end
-return sb.line_comment_leaders()
+if not ok then return { leaders = {}, addon = { extra_breaks = {}, suppress_blanks = {} } } end
+local leaders = sb.line_comment_leaders()
+local addon = sb.treesitter_addon()
+return { leaders = leaders, addon = addon }
 """,
         [],
         timeout=timeout,
     )
-    out: list[tuple[str, bool]] = []
-    if isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, dict) and item.get("leader"):
-                out.append((str(item["leader"]), bool(item.get("blank_required"))))
-    return out
+    leaders: list[tuple[str, bool]] = []
+    extra: set[int] = set()
+    suppress: list[tuple[int, int]] = []
+    if isinstance(raw, dict):
+        raw_leaders = raw.get("leaders")
+        if isinstance(raw_leaders, list):
+            for item in raw_leaders:
+                if isinstance(item, dict) and item.get("leader"):
+                    leaders.append((str(item["leader"]), bool(item.get("blank_required"))))
+        addon = raw.get("addon")
+        if isinstance(addon, dict):
+            raw_extra = addon.get("extra_breaks")
+            if isinstance(raw_extra, list):
+                for x in raw_extra:
+                    try:
+                        extra.add(int(x))
+                    except (TypeError, ValueError):
+                        pass
+            raw_suppress = addon.get("suppress_blanks")
+            if isinstance(raw_suppress, list):
+                for item in raw_suppress:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        suppress.append((int(item[0]), int(item[1])))
+                    elif isinstance(item, dict):
+                        s = item.get("start", item.get(1))
+                        e = item.get("end", item.get(2))
+                        if s is not None and e is not None:
+                            suppress.append((int(s), int(e)))
+    return leaders, extra, suppress
 
 
 def _estimate_rows(paths: list[str]) -> int:
@@ -1616,15 +1643,27 @@ def capture(width: int, files: list[str]) -> int:
                 buf_text = []
 
             leaders: list[tuple[str, bool]] = []
+            extra_breaks: set[int] = set()
+            suppress_blanks: list[tuple[int, int]] = []
             try:
-                leaders = _fetch_comment_leaders(nv, _page_rpc_timeout(deadline))
+                leaders, extra_breaks, suppress_blanks = _fetch_soft_break_info(
+                    nv, _page_rpc_timeout(deadline)
+                )
             except (TimeoutError, RuntimeError):
                 leaders = []
+                extra_breaks = set()
+                suppress_blanks = []
 
             stitch_h = _stitch_ui_height()
             last_line = len(buf_text) if buf_text else int(buf_lines or 1)
             segments = (
-                _soft_break_segments(buf_text, leaders, ui_max=_UI_MAX_LINES)
+                _soft_break_segments(
+                    buf_text,
+                    leaders,
+                    ui_max=_UI_MAX_LINES,
+                    extra_breaks=extra_breaks,
+                    suppress_blanks=suppress_blanks,
+                )
                 if buf_text
                 else [(1, last_line)]
             )
