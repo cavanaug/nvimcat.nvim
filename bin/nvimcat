@@ -819,6 +819,42 @@ class NvimEmbed:
             pass
 
 
+def _exec_embed(
+    nv: "NvimEmbed", fn: str, args: list[Any] | None = None, timeout: float = 1.0
+) -> Any:
+    """Call a function in lua/nvimcat/embed.lua inside the embedded nvim.
+
+    Loaded via loadfile() from NVIMCAT_ROOT so Lazy's require hijack cannot
+    reroute the module to a plugin spec (same pattern as scripts/cli-entry.lua).
+    """
+    chunk = (
+        "local r = assert(vim.env.NVIMCAT_ROOT or vim.g.nvimcat_root, 'NVIMCAT_ROOT unset')\n"
+        "local m = assert(loadfile(r .. '/lua/nvimcat/embed.lua'))()\n"
+        f"return m.{fn}(...)"
+    )
+    return nv.request("nvim_exec_lua", chunk, args or [], timeout=timeout)
+
+
+def _get_var(nv: "NvimEmbed", name: str, timeout: float) -> Any:
+    """nvim_get_var that swallows RPC timeouts/errors (returns None)."""
+    try:
+        return nv.request("nvim_get_var", name, timeout=timeout)
+    except (TimeoutError, RuntimeError):
+        return None
+
+
+def _embed_env(root: str, width: int, files: list[str], compose: bool = False) -> dict[str, str]:
+    env = os.environ.copy()
+    env["NVIMCAT"] = "1"
+    env["NVIMCAT_ROOT"] = root
+    env["NVIMCAT_WIDTH"] = str(width)
+    env["NVIMCAT_EMBED"] = "1"
+    if compose:
+        env["NVIMCAT_COMPOSE"] = "1"
+    env["NVIMCAT_FILES"] = "\x1e".join(files) + ("\x1e" if files else "")
+    return env
+
+
 def _nvim_child_setup() -> None:
     """Linux: die when parent nvimcat dies (agent interrupt / outer timeout)."""
     try:
@@ -948,20 +984,7 @@ def _soft_break_segments(
 def _fetch_soft_break_info(
     nv: "NvimEmbed", timeout: float
 ) -> tuple[list[tuple[str, bool]], set[int], list[tuple[int, int]]]:
-    raw = nv.request(
-        "nvim_exec_lua",
-        """
-local ok, sb = pcall(require, "nvimcat.soft_break")
-if not ok then
-  return { leaders = {}, addon = { extra_breaks = {}, suppress_blanks = {} } }
-end
-local leaders = sb.line_comment_leaders()
-local addon = sb.treesitter_addon()
-return { leaders = leaders, addon = addon }
-""",
-        [],
-        timeout=timeout,
-    )
+    raw = _exec_embed(nv, "soft_break_info", timeout=timeout)
     leaders: list[tuple[str, bool]] = []
     extra: set[int] = set()
     suppress: list[tuple[int, int]] = []
@@ -1185,193 +1208,12 @@ def _wait_grid_change(
 
 
 def _compose_load_plugins(nv: "NvimEmbed", timeout: float) -> None:
-    nv.request(
-        "nvim_exec_lua",
-        """
-local ok = pcall(require, "lazy")
-if ok then
-  local loader_ok, loader = pcall(require, "lazy.core.loader")
-  if loader_ok then
-    pcall(loader.load, {
-      plugins = {
-        "render-markdown.nvim",
-        "render-markdown-mermaid.nvim",
-      },
-    }, { start = "nvimcat-compose" })
-  end
-  pcall(vim.cmd, "doautocmd FileType " .. (vim.bo.filetype ~= "" and vim.bo.filetype or "markdown"))
-end
-local width = tonumber(vim.env.NVIMCAT_WIDTH)
-if width then
-  vim.o.columns = width
-end
-pcall(function()
-  vim.wo[vim.api.nvim_get_current_win()].conceallevel = 2
-  vim.wo[vim.api.nvim_get_current_win()].concealcursor = "nvic"
-end)
-local ok_ui, ui = pcall(require, "render-markdown.core.ui")
-if ok_ui then
-  pcall(function() require("render-markdown").set(true) end)
-  pcall(ui.update, vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win(),
-    "nvimcat-compose", true)
-  vim.cmd("redraw!")
-end
-return ok_ui
-""",
-        [],
-        timeout=timeout,
-    )
-
-
-_SILENCE_CHROME_LUA = """
-local win = vim.api.nvim_get_current_win()
-local buf = vim.api.nvim_get_current_buf()
-vim.o.laststatus = 0
-vim.o.showtabline = 0
-vim.o.cmdheight = 0
--- Stitch parks cursor on topline; keep links concealed (not anti-conceal raw).
-vim.wo[win].conceallevel = 2
-vim.wo[win].concealcursor = "nvic"
-pcall(function()
-  local state = require("render-markdown.state")
-  local function disable(cfg)
-    if not cfg then return end
-    if cfg.anti_conceal then cfg.anti_conceal.enabled = false end
-    cfg.win_options = cfg.win_options or {}
-    cfg.win_options.concealcursor = cfg.win_options.concealcursor or {}
-    cfg.win_options.concealcursor.rendered = "nvic"
-  end
-  disable(state.config)
-  for _, cfg in pairs(state.cache or {}) do disable(cfg) end
-end)
-pcall(function()
-  vim.o.winbar = ""
-  vim.wo[win].winbar = ""
-end)
-pcall(function()
-  require("lualine").hide({
-    place = { "statusline", "tabline", "winbar" },
-    unhide = false,
-  })
-end)
-pcall(function()
-  require("snacks").notifier.hide()
-end)
-pcall(function()
-  require("noice").disable()
-end)
-pcall(function()
-  local opts = require("noice.config").options
-  if opts and opts.lsp and opts.lsp.progress then
-    opts.lsp.progress.enabled = false
-  end
-end)
-for _, client in ipairs(vim.lsp.get_clients()) do
-  local name = tostring(client.name or ""):lower()
-  if name:find("rumdl", 1, true) then
-    pcall(vim.lsp.stop_client, client.id, true)
-  end
-end
-for _, w in ipairs(vim.api.nvim_list_wins()) do
-  local ok, cfg = pcall(vim.api.nvim_win_get_config, w)
-  if ok and cfg.relative ~= nil and cfg.relative ~= "" then
-    pcall(vim.api.nvim_win_close, w, true)
-  end
-end
-for name, id in pairs(vim.api.nvim_get_namespaces()) do
-  local n = tostring(name):lower()
-  if n:find("rumdl", 1, true) or n:find("notifier", 1, true)
-    or n:find("notify", 1, true) or n:find("snacks", 1, true)
-    or n:find("noice", 1, true) then
-    pcall(vim.api.nvim_buf_clear_namespace, buf, id, 0, -1)
-  end
-end
-"""
-
-_PRE_STITCH_RENDER_LUA = """
-local buf = vim.api.nvim_get_current_buf()
-local win = vim.api.nvim_get_current_win()
-local ok, ui = pcall(require, "render-markdown.core.ui")
-if not ok then
-  vim.cmd("redraw!")
-  return
-end
-pcall(function() require("render-markdown").set(true) end)
-local decorator = ui.get(buf)
-local before = decorator.n
-pcall(function()
-  ui.update(buf, win, "nvimcat-pre-stitch", true)
-end)
-local stable = 0
-local last = before
-vim.wait(5000, function()
-  if decorator.running then
-    stable = 0
-    return false
-  end
-  local now = decorator.n
-  -- ui.update can legitimately be a no-op when the full syntax node is
-  -- already decorated. Waiting for a generation bump in that case burns the
-  -- entire timeout even though the renderer is idle and stable.
-  if now == last then
-    stable = stable + 1
-    return stable >= 5
-  end
-  last = now
-  stable = 0
-  return false
-end, 25)
-vim.cmd("redraw!")
-"""
+    _exec_embed(nv, "compose_load_plugins", timeout=timeout)
 
 
 def _scroll_page(nv: "NvimEmbed", next_top: int, timeout: float) -> None:
     """Scroll so topline=next_top and force a render-markdown update for the new viewport."""
-    nv.request(
-        "nvim_exec_lua",
-        f"""
-local top = {int(next_top)}
-local win = vim.api.nvim_get_current_win()
-local buf = vim.api.nvim_get_current_buf()
-local view = vim.fn.winsaveview()
-vim.fn.winrestview({{ lnum = top, col = 0, topline = top, leftcol = 0 }})
-{_SILENCE_CHROME_LUA}
-if (view.topline or 1) == top then
-  vim.cmd("redraw!")
-  return
-end
-local ok, ui = pcall(require, "render-markdown.core.ui")
-if not ok then
-  vim.cmd("redraw!")
-  return
-end
-local decorator = ui.get(buf)
-local before = decorator.n
-pcall(function()
-  ui.update(buf, win, "nvimcat-page", true)
-end)
--- Wait for this page's parse to finish, not just bump decorator.n once.
-local last = before
-local stable = 0
-vim.wait(3000, function()
-  if decorator.running then
-    stable = 0
-    return false
-  end
-  local now = decorator.n
-  if now == last then
-    stable = stable + 1
-    return stable >= 3
-  end
-  last = now
-  stable = 0
-  return false
-end, 20)
-vim.cmd("redraw!")
-""",
-        [],
-        timeout=timeout,
-    )
+    _exec_embed(nv, "scroll_page", [int(next_top)], timeout=timeout)
 
 
 _COMPOSE_BUFFER_LINES = 250
@@ -1441,16 +1283,9 @@ def _capture_composed(width: int, files: list[str]) -> int | None:
     if not (Path(root) / "lua" / "nvimcat").is_dir():
         root = str(_ROOT)
     timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "180"))
-    env = os.environ.copy()
-    env["NVIMCAT"] = "1"
-    env["NVIMCAT_ROOT"] = root
-    env["NVIMCAT_WIDTH"] = str(width)
-    env["NVIMCAT_COMPOSE"] = "1"
-    env["NVIMCAT_EMBED"] = "1"
-    env["NVIMCAT_FILES"] = "\x1e".join(files) + ("\x1e" if files else "")
+    env = _embed_env(root, width, files, compose=True)
 
-    nvim_bin = env.get("NVIMCAT_NVIM_BIN", "nvim")
-    nv = NvimEmbed(argv=_nvim_argv(root, nvim_bin), env=env)
+    nv = NvimEmbed(argv=_nvim_argv(root), env=env)
     deadline = time.time() + timeout
     wrote_any = False
     rc = 1
@@ -1466,19 +1301,11 @@ def _capture_composed(width: int, files: list[str]) -> int | None:
             if nv._proc.poll() is not None:
                 return None if not wrote_any else 1
 
-            try:
-                done = nv.request("nvim_get_var", "nvimcat_done", timeout=0.5)
-            except (TimeoutError, RuntimeError):
-                done = 0
-            if done == 1:
+            if _get_var(nv, "nvimcat_done", 0.5) == 1:
                 rc = 0
                 break
 
-            try:
-                capture = nv.request("nvim_get_var", "nvimcat_capture", timeout=0.5)
-            except (TimeoutError, RuntimeError):
-                continue
-            if capture != 1:
+            if _get_var(nv, "nvimcat_capture", 0.5) != 1:
                 continue
 
             try:
@@ -1530,6 +1357,147 @@ def _capture_composed(width: int, files: list[str]) -> int | None:
     return rc
 
 
+def _overlap_bounds(
+    prev_seg_start: int | None, prev_page_h: int, seg_start: int
+) -> tuple[int, int]:
+    """How much the previous page may overlap this one: (cap, fallback_trim)."""
+    overlap_cap = prev_page_h
+    fallback_trim = 0
+    if prev_seg_start is not None:
+        delta = max(0, seg_start - prev_seg_start)
+        if delta >= prev_page_h:
+            overlap_cap = 0
+        else:
+            # ponytail: +16 virt/chrome slack only; paint floor skews page_h.
+            fallback_trim = min(16, prev_page_h - delta)
+            slack = min(prev_page_h, max(16, delta * 4))
+            overlap_cap = min(prev_page_h, prev_page_h - delta + slack)
+    return overlap_cap, fallback_trim
+
+
+def _prime_first_page(
+    nv: "NvimEmbed",
+    grid: Grid,
+    grid_lock: threading.Lock,
+    flush_ev: threading.Event,
+    deadline: float,
+    buf_lines: int | None,
+    height: int,
+) -> None:
+    """Before the first stitch page: scroll back to top (LazyVim last_loc may
+    have jumped to EOF) and run one forced render pass."""
+    if isinstance(buf_lines, int) and buf_lines > height:
+        flush_ev.clear()
+        try:
+            with grid_lock:
+                before_top = grid.to_ansi()
+            _scroll_page(nv, 1, _page_rpc_timeout(deadline))
+            _wait_grid_change(nv, grid, grid_lock, flush_ev, before_top, deadline=deadline)
+        except (TimeoutError, RuntimeError) as exc:
+            print(f"nvimcat: scroll-to-top failed: {exc}", file=sys.stderr)
+        flush_ev.clear()
+
+    try:
+        _exec_embed(nv, "pre_stitch_render", timeout=_page_rpc_timeout(deadline))
+        flush_ev.wait(timeout=min(1.0, max(0.0, deadline - time.time())))
+    except (TimeoutError, RuntimeError) as exc:
+        print(f"nvimcat: pre-stitch render failed: {exc}", file=sys.stderr)
+    flush_ev.clear()
+
+
+def _fetch_stitch_context(
+    nv: "NvimEmbed", deadline: float
+) -> tuple[list[str], list[tuple[str, bool]], set[int], list[tuple[int, int]]]:
+    """Buffer text plus soft-break facts for segmentation."""
+    buf_text: list[str] = []
+    try:
+        raw_lines = nv.request(
+            "nvim_buf_get_lines", 0, 0, -1, True, timeout=_page_rpc_timeout(deadline)
+        )
+        if isinstance(raw_lines, list):
+            buf_text = [str(x) for x in raw_lines]
+    except (TimeoutError, RuntimeError):
+        buf_text = []
+    try:
+        info = _fetch_soft_break_info(nv, _page_rpc_timeout(deadline))
+        return buf_text, info[0], info[1], info[2]
+    except (TimeoutError, RuntimeError):
+        return buf_text, [], set(), []
+
+
+def _stitch_segments(
+    nv: "NvimEmbed",
+    grid: Grid,
+    grid_lock: threading.Lock,
+    flush_ev: threading.Event,
+    output_parts: list[bytes],
+    segments: list[tuple[int, int]],
+    deadline: float,
+    width: int,
+    height: int,
+    stitch_h: int,
+    pages_done: int,
+) -> tuple[bool, int, int]:
+    """Grow the paint to fit each segment, scroll to it, trim overlap, append.
+    Returns (ok, pages_stitched, final_height)."""
+    pages = 0
+    prev_seg_start: int | None = None
+    prev_page_h = 0
+    for seg_start, seg_end in segments:
+        if time.time() >= deadline or pages_done + pages >= 500:
+            return False, pages, height
+        block_len = max(1, seg_end - seg_start + 1)
+        page_h = min(_UI_MAX_LINES, max(stitch_h, block_len + 16))
+
+        if page_h != height:
+            flush_ev.clear()
+            try:
+                nv.request(
+                    "nvim_ui_try_resize", width, page_h, timeout=_page_rpc_timeout(deadline)
+                )
+                height = page_h
+                nv.request(
+                    "nvim_command", "redraw!", timeout=_page_rpc_timeout(deadline)
+                )
+                flush_ev.wait(timeout=min(1.0, max(0.0, deadline - time.time())))
+            except (TimeoutError, RuntimeError) as exc:
+                print(f"nvimcat: page resize failed: {exc}", file=sys.stderr)
+                return False, pages, height
+            flush_ev.clear()
+
+        flush_ev.clear()
+        try:
+            with grid_lock:
+                before = grid.to_ansi()
+            _scroll_page(nv, seg_start, _page_rpc_timeout(deadline))
+            _wait_grid_change(
+                nv, grid, grid_lock, flush_ev, before, deadline=deadline, max_wait=0.5
+            )
+        except (TimeoutError, RuntimeError) as exc:
+            print(f"nvimcat: scroll failed: {exc}", file=sys.stderr)
+            return False, pages, height
+        flush_ev.clear()
+
+        with grid_lock:
+            part = grid.to_ansi()
+        if output_parts:
+            overlap_cap, fallback_trim = _overlap_bounds(prev_seg_start, prev_page_h, seg_start)
+            output_parts[-1], part = _trim_page_overlap(
+                output_parts[-1],
+                part,
+                max_overlap=overlap_cap,
+                fallback_trim=fallback_trim,
+            )
+        if part:
+            if output_parts and not output_parts[-1].endswith(b"\n"):
+                output_parts.append(b"\n")
+            output_parts.append(part)
+        pages += 1
+        prev_seg_start = seg_start
+        prev_page_h = page_h
+    return True, pages, height
+
+
 def capture(width: int, files: list[str]) -> int:
     if os.environ.get("NVIMCAT_COMPOSE") == "1":
         composed = _capture_composed(width, files)
@@ -1543,12 +1511,7 @@ def capture(width: int, files: list[str]) -> int:
     height = _estimate_rows(files)
     timeout = float(os.environ.get("NVIMCAT_TIMEOUT", "180"))
 
-    env = os.environ.copy()
-    env["NVIMCAT"] = "1"
-    env["NVIMCAT_ROOT"] = root
-    env["NVIMCAT_WIDTH"] = str(width)
-    env["NVIMCAT_EMBED"] = "1"
-    env["NVIMCAT_FILES"] = "\x1e".join(files) + ("\x1e" if files else "")
+    env = _embed_env(root, width, files)
 
     grid = Grid()
     grid_lock = threading.Lock()
@@ -1584,11 +1547,7 @@ def capture(width: int, files: list[str]) -> int:
                 continue
             flush_ev.clear()
 
-            try:
-                done = nv.request("nvim_get_var", "nvimcat_done", timeout=remaining)
-            except (TimeoutError, RuntimeError):
-                done = 0
-            if done == 1:
+            if _get_var(nv, "nvimcat_done", remaining) == 1:
                 sys.stdout.buffer.write(b"".join(output_parts))
                 sys.stdout.buffer.flush()
                 try:
@@ -1598,24 +1557,12 @@ def capture(width: int, files: list[str]) -> int:
                 rc = 0
                 break
 
-            try:
-                cap = nv.request("nvim_get_var", "nvimcat_capture", timeout=remaining)
-            except (TimeoutError, RuntimeError):
-                continue
-            if cap != 1:
+            if _get_var(nv, "nvimcat_capture", remaining) != 1:
                 continue
 
             if not awaiting_resize_flush:
-                try:
-                    rows = nv.request("nvim_get_var", "nvimcat_rows", timeout=remaining)
-                except (TimeoutError, RuntimeError):
-                    rows = None
-                try:
-                    buf_lines = nv.request(
-                        "nvim_get_var", "nvimcat_buf_lines", timeout=remaining
-                    )
-                except (TimeoutError, RuntimeError):
-                    buf_lines = None
+                rows = _get_var(nv, "nvimcat_rows", remaining)
+                buf_lines = _get_var(nv, "nvimcat_buf_lines", remaining)
                 # Whole buffer fits in one UI page → resize once. Tall buffers keep
                 # the page height and scroll-stitch (Neovim clamps &lines at 1000).
                 fits = (
@@ -1632,72 +1579,15 @@ def capture(width: int, files: list[str]) -> int:
                     awaiting_resize_flush = True
                     continue
 
-            # Tall buffers: plugins (LazyVim last_loc) may have scrolled to EOF
-            # after Lua pinned topline=1. Force page 1 before stitching.
-            if (
-                pages_done == 0
-                and isinstance(buf_lines, int)
-                and buf_lines > height
-            ):
-                flush_ev.clear()
-                try:
-                    with grid_lock:
-                        before_top = grid.to_ansi()
-                    _scroll_page(nv, 1, _page_rpc_timeout(deadline))
-                    _wait_grid_change(
-                        nv,
-                        grid,
-                        grid_lock,
-                        flush_ev,
-                        before_top,
-                        deadline=deadline,
-                    )
-                except (TimeoutError, RuntimeError) as exc:
-                    print(f"nvimcat: scroll-to-top failed: {exc}", file=sys.stderr)
-                flush_ev.clear()
-
             if pages_done == 0:
-                try:
-                    nv.request(
-                        "nvim_exec_lua",
-                        _PRE_STITCH_RENDER_LUA,
-                        [],
-                        timeout=_page_rpc_timeout(deadline),
-                    )
-                    flush_ev.wait(
-                        timeout=min(1.0, max(0.0, deadline - time.time()))
-                    )
-                except (TimeoutError, RuntimeError) as exc:
-                    print(f"nvimcat: pre-stitch render failed: {exc}", file=sys.stderr)
-                flush_ev.clear()
+                _prime_first_page(
+                    nv, grid, grid_lock, flush_ev, deadline, buf_lines, height
+                )
 
             # Soft-break segments: grow paint to fit each segment, scroll to seg.start.
-            buf_text: list[str] = []
-            try:
-                raw_lines = nv.request(
-                    "nvim_buf_get_lines",
-                    0,
-                    0,
-                    -1,
-                    True,
-                    timeout=_page_rpc_timeout(deadline),
-                )
-                if isinstance(raw_lines, list):
-                    buf_text = [str(x) for x in raw_lines]
-            except (TimeoutError, RuntimeError):
-                buf_text = []
-
-            leaders: list[tuple[str, bool]] = []
-            extra_breaks: set[int] = set()
-            suppress_blanks: list[tuple[int, int]] = []
-            try:
-                leaders, extra_breaks, suppress_blanks = _fetch_soft_break_info(
-                    nv, _page_rpc_timeout(deadline)
-                )
-            except (TimeoutError, RuntimeError):
-                leaders = []
-                extra_breaks = set()
-                suppress_blanks = []
+            buf_text, leaders, extra_breaks, suppress_blanks = _fetch_stitch_context(
+                nv, deadline
+            )
 
             stitch_h = _stitch_ui_height()
             last_line = len(buf_text) if buf_text else int(buf_lines or 1)
@@ -1713,94 +1603,21 @@ def capture(width: int, files: list[str]) -> int:
                 else [(1, last_line)]
             )
 
-            prev_seg_start: int | None = None
-            prev_page_h: int | None = None
-            stitch_ok = True
-            for seg_start, seg_end in segments:
-                if time.time() >= deadline or pages_done >= 500:
-                    stitch_ok = False
-                    break
-                block_len = max(1, seg_end - seg_start + 1)
-                page_h = min(_UI_MAX_LINES, max(stitch_h, block_len + 16))
-
-                if page_h != height:
-                    flush_ev.clear()
-                    try:
-                        nv.request(
-                            "nvim_ui_try_resize",
-                            width,
-                            page_h,
-                            timeout=_page_rpc_timeout(deadline),
-                        )
-                        height = page_h
-                        nv.request(
-                            "nvim_command",
-                            "redraw!",
-                            timeout=_page_rpc_timeout(deadline),
-                        )
-                        flush_ev.wait(
-                            timeout=min(1.0, max(0.0, deadline - time.time()))
-                        )
-                    except (TimeoutError, RuntimeError) as exc:
-                        print(f"nvimcat: page resize failed: {exc}", file=sys.stderr)
-                        stitch_ok = False
-                        break
-                    flush_ev.clear()
-
-                flush_ev.clear()
-                try:
-                    with grid_lock:
-                        before = grid.to_ansi()
-                    _scroll_page(nv, seg_start, _page_rpc_timeout(deadline))
-                    _wait_grid_change(
-                        nv,
-                        grid,
-                        grid_lock,
-                        flush_ev,
-                        before,
-                        deadline=deadline,
-                        max_wait=0.5,
-                    )
-                except (TimeoutError, RuntimeError) as exc:
-                    print(f"nvimcat: scroll failed: {exc}", file=sys.stderr)
-                    stitch_ok = False
-                    break
-                flush_ev.clear()
-
-                with grid_lock:
-                    part = grid.to_ansi()
-                if output_parts:
-                    overlap_cap = prev_page_h
-                    fallback_trim = 0
-                    if (
-                        prev_seg_start is not None
-                        and prev_page_h is not None
-                    ):
-                        delta = max(0, seg_start - prev_seg_start)
-                        if delta >= prev_page_h:
-                            overlap_cap = 0
-                        else:
-                            # ponytail: +16 virt/chrome slack only; paint floor skews page_h.
-                            fallback_trim = min(16, prev_page_h - delta)
-                            slack = min(prev_page_h, max(16, delta * 4))
-                            overlap_cap = min(
-                                prev_page_h,
-                                prev_page_h - delta + slack,
-                            )
-                    output_parts[-1], part = _trim_page_overlap(
-                        output_parts[-1],
-                        part,
-                        max_overlap=overlap_cap,
-                        fallback_trim=fallback_trim,
-                    )
-                if part:
-                    if output_parts and not output_parts[-1].endswith(b"\n"):
-                        output_parts.append(b"\n")
-                    output_parts.append(part)
-                pages_done += 1
-                awaiting_resize_flush = False
-                prev_seg_start = seg_start
-                prev_page_h = page_h
+            stitch_ok, pages, height = _stitch_segments(
+                nv,
+                grid,
+                grid_lock,
+                flush_ev,
+                output_parts,
+                segments,
+                deadline,
+                width,
+                height,
+                stitch_h,
+                pages_done,
+            )
+            pages_done += pages
+            awaiting_resize_flush = False
 
             if not stitch_ok or pages_done < len(segments):
                 print(
@@ -1839,17 +1656,6 @@ def smoke(width: int) -> int:
         nv.close()
     return 0
 
-
-def main() -> int:
-    if len(sys.argv) >= 3 and sys.argv[1] == "--smoke":
-        return smoke(int(sys.argv[2]))
-    if len(sys.argv) < 3:
-        print("usage: nvimcat-embed WIDTH <file>...", file=sys.stderr)
-        print("       nvimcat-embed --smoke WIDTH", file=sys.stderr)
-        return 2
-    width = int(sys.argv[1])
-    files = sys.argv[2:]
-    return capture(width, files)
 
 # --- CLI --------------------------------------------------------------------
 
@@ -1902,13 +1708,6 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "--compose":
         os.environ["NVIMCAT_COMPOSE"] = "1"
         argv = argv[1:]
-
-    # Legacy: WIDTH file... (old nvimcat-embed argv)
-    if len(argv) >= 2 and argv[0].isdigit() and not Path(argv[0]).exists():
-        width = int(argv[0])
-        files = _abs_files(argv[1:])
-        os.environ["NVIMCAT_WIDTH"] = str(width)
-        return capture(width, files)
 
     if not argv:
         print("usage: nvimcat [--compose] [--width N] <file>...", file=sys.stderr)

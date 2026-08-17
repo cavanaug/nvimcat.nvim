@@ -196,15 +196,18 @@ local function try_force_render(buf, win, need_mermaid)
   pcall(vim.api.nvim_exec_autocmds, "BufWinEnter", { buffer = buf })
 end
 
+--- True when any extmark paints table chrome (box-drawing glyphs in virt_text
+--- or multi-grid virt_lines — overlays may live outside render-markdown's ns).
 local function has_table_decor(buf)
-  for name, id in pairs(vim.api.nvim_get_namespaces()) do
-    local from_rm = name:find("render%-markdown", 1, false) ~= nil
+  local function has_box_glyphs(text)
+    return text:find("┌") or text:find("│") or text:find("├") or text:find("╰")
+  end
+  for _, id in pairs(vim.api.nvim_get_namespaces()) do
     for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, id, 0, -1, { details = true })) do
       local d = m[4] or {}
-      if d.virt_text and from_rm then
+      if d.virt_text then
         for _, chunk in ipairs(d.virt_text) do
-          local t = chunk[1] or ""
-          if t:find("┌") or t:find("│") or t:find("├") or t:find("╰") then
+          if has_box_glyphs(chunk[1] or "") then
             return true
           end
         end
@@ -283,6 +286,18 @@ local function render_generation(buf)
   return ok and decorator and decorator.n or nil
 end
 
+--- Force a render and wait (bounded) for the decorator generation to advance.
+--- With require_ready, also keep waiting until decorations are present.
+local function wait_generation_bump(buf, win, opts, need_mermaid, require_ready)
+  local before = render_generation(buf)
+  try_force_render(buf, win, need_mermaid)
+  vim.wait(math.min(500, opts.timeout_ms), function()
+    local generation = render_generation(buf)
+    local bumped = before == nil or (generation ~= nil and generation > before)
+    return bumped and (not require_ready or is_ready(buf, need_mermaid))
+  end, 20)
+end
+
 local function settle(buf, win, opts, need_mermaid)
   -- Non-markdown: no render-markdown work — do not wait for a generation bump.
   if not wants_render_markdown(buf) then
@@ -301,13 +316,7 @@ local function settle(buf, win, opts, need_mermaid)
   end, 20)
   if not ok then
     -- One last nudge, then brief wait — still no per-tick thrash.
-    before = render_generation(buf)
-    try_force_render(buf, win, need_mermaid)
-    vim.wait(math.min(500, opts.timeout_ms), function()
-      local generation = render_generation(buf)
-      return is_ready(buf, need_mermaid)
-        and (before == nil or (generation ~= nil and generation > before))
-    end, 20)
+    wait_generation_bump(buf, win, opts, need_mermaid, true)
   end
   if not is_ready(buf, need_mermaid) then
     io.stderr:write(
@@ -354,29 +363,47 @@ local function disable_anti_conceal()
   end)
 end
 
---- Silence LSP paint without quitting clients that emit snacks quit warnings.
+--- Silence one LSP client: no semantic-token paint, no quit-warning floats.
 --- rumdl is force-stopped: its workspace indexer + noice progress overlays
 --- corrupt mid-stitch grid cells nondeterministically.
+local function mute_client(client, buf)
+  pcall(function()
+    client.server_capabilities.semanticTokensProvider = nil
+  end)
+  if buf then
+    pcall(vim.lsp.semantic_tokens.stop, buf, client.id)
+  end
+  local name = tostring(client.name or ""):lower()
+  if name:find("rumdl", 1, true) then
+    pcall(vim.lsp.stop_client, client.id, true)
+  else
+    pcall(vim.lsp.stop_client, client.id, false)
+  end
+end
+
 local function mute_lsp_paint(buf)
   for _, client in ipairs(vim.lsp.get_clients()) do
-    pcall(function()
-      client.server_capabilities.semanticTokensProvider = nil
-    end)
-    pcall(function()
-      vim.lsp.semantic_tokens.stop(buf, client.id)
-    end)
-    local name = tostring(client.name or ""):lower()
-    if name:find("rumdl", 1, true) then
-      pcall(vim.lsp.stop_client, client.id, true)
-    else
-      pcall(vim.lsp.stop_client, client.id, false)
-    end
+    mute_client(client, buf)
   end
   for name, id in pairs(vim.api.nvim_get_namespaces()) do
     if name:find("semantic_tokens", 1, true) then
       pcall(vim.api.nvim_buf_clear_namespace, buf, id, 0, -1)
     end
   end
+end
+
+--- Strip every window-local chrome option that would leak into the capture.
+local function sanitize_window(win)
+  pcall(function()
+    vim.wo[win].number = false
+    vim.wo[win].relativenumber = false
+    vim.wo[win].signcolumn = "no"
+    vim.wo[win].foldcolumn = "0"
+    vim.wo[win].statuscolumn = ""
+    vim.wo[win].list = false
+    vim.wo[win].cursorline = false
+    vim.wo[win].wrap = false
+  end)
 end
 
 local function close_floating_windows()
@@ -556,7 +583,6 @@ function M.dump(opts)
   _timing("dump_enter")
   opts = merge(opts)
   prepare_chrome(opts)
-  disable_side_effect_plugins(opts)
 
   if opts.file and opts.file ~= "" then
     vim.cmd("edit " .. vim.fn.fnameescape(opts.file))
@@ -568,16 +594,7 @@ function M.dump(opts)
   -- LazyVim BufReadPost last_loc is deferred via lazy file events and can jump
   -- to the '"' mark after we reset topline=1 — that starts scroll-stitch at EOF.
   vim.b[buf].lazyvim_last_loc = true
-  pcall(function()
-    vim.wo[win].number = false
-    vim.wo[win].relativenumber = false
-    vim.wo[win].signcolumn = "no"
-    vim.wo[win].foldcolumn = "0"
-    vim.wo[win].statuscolumn = ""
-    vim.wo[win].list = false
-    vim.wo[win].cursorline = false
-    vim.wo[win].wrap = false
-  end)
+  sanitize_window(win)
   vim.o.signcolumn = "no"
   vim.o.number = false
   pcall(vim.diagnostic.enable, false)
@@ -608,13 +625,7 @@ function M.dump(opts)
   -- winrestview changes the visible range after settle; refresh decorations
   -- for the restored first page before the capture client snapshots the grid.
   if wants_render_markdown(buf) then
-    local before_view_render = render_generation(buf)
-    try_force_render(buf, win, need_mermaid)
-    vim.wait(math.min(500, opts.timeout_ms), function()
-      local generation = render_generation(buf)
-      return before_view_render == nil
-        or (generation ~= nil and generation > before_view_render)
-    end, 20)
+    wait_generation_bump(buf, win, opts, need_mermaid)
   end
   -- Re-assert chrome: LazyVim/lualine may flip laststatus back on.
   vim.o.laststatus = 0
@@ -665,12 +676,7 @@ function M.dump(opts)
       vim.fn.winrestview({ lnum = 1, col = 0, topline = 1, leftcol = 0 })
     end)
     if wants_render_markdown(buf) then
-      local before = render_generation(buf)
-      try_force_render(buf, win, need_mermaid)
-      vim.wait(math.min(500, opts.timeout_ms), function()
-        local generation = render_generation(buf)
-        return before == nil or (generation ~= nil and generation > before)
-      end, 20)
+      wait_generation_bump(buf, win, opts, need_mermaid)
     end
   end
 
@@ -805,16 +811,7 @@ function M.cli()
     callback = function(args)
       local client = vim.lsp.get_client_by_id(args.data.client_id)
       if client then
-        client.server_capabilities.semanticTokensProvider = nil
-      end
-      pcall(vim.lsp.semantic_tokens.stop, args.buf, args.data.client_id)
-      local name = client and tostring(client.name or ""):lower() or ""
-      -- rumdl workspace indexer + noice progress corrupt the grid; force-stop.
-      if name:find("rumdl", 1, true) then
-        pcall(vim.lsp.stop_client, args.data.client_id, true)
-      else
-        -- Soft-stop others: hard quit → snacks warning float into the grid.
-        pcall(vim.lsp.stop_client, args.data.client_id, false)
+        mute_client(client, args.buf)
       end
       pcall(function()
         require("snacks").notifier.hide()
@@ -883,16 +880,7 @@ function M.prep_compare()
   prepare_chrome(merge({}))
   local buf = vim.api.nvim_get_current_buf()
   local win = vim.api.nvim_get_current_win()
-  pcall(function()
-    vim.wo[win].number = false
-    vim.wo[win].relativenumber = false
-    vim.wo[win].signcolumn = "no"
-    vim.wo[win].foldcolumn = "0"
-    vim.wo[win].statuscolumn = ""
-    vim.wo[win].list = false
-    vim.wo[win].cursorline = false
-    vim.wo[win].wrap = false
-  end)
+  sanitize_window(win)
   -- Stop LSP paint from overriding @markup.link on [S12]-style cites.
   mute_lsp_paint(buf)
   close_floating_windows()

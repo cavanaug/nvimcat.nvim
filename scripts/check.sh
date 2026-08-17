@@ -40,8 +40,8 @@ print("\n".join(plain.splitlines()[:20]))
 sys.exit(0 if all(checks.values()) else 1)
 PY
 
-RESEARCH="${NVIMCAT_PERF_FILE:-$HOME/wip_other/research/terminal-markdown-renderers/README.md}"
-if [[ -f "$RESEARCH" ]]; then
+RESEARCH="${NVIMCAT_PERF_FILE:-}"
+if [[ -n "$RESEARCH" && -f "$RESEARCH" ]]; then
   research_times=()
   for _ in 1 2 3; do
     start_ms="$(date +%s%3N)"
@@ -72,8 +72,8 @@ sys.exit(0 if all(checks.values()) else 1)
 PY
 fi
 
-GRANULAR_SCOPES="${NVIMCAT_GRANULAR_SCOPES_FILE:-$HOME/wip_other/src_cavanaug/zoom-cli/.opencode/skills/zoom-skills/oauth/references/granular-scopes.md}"
-if [[ -f "$GRANULAR_SCOPES" ]]; then
+GRANULAR_SCOPES="${NVIMCAT_GRANULAR_SCOPES_FILE:-}"
+if [[ -n "$GRANULAR_SCOPES" && -f "$GRANULAR_SCOPES" ]]; then
   echo "granular-scopes acid test: $GRANULAR_SCOPES"
   bash "$ROOT/scripts/check-granular-scopes-tables.sh" "$GRANULAR_SCOPES"
 fi
