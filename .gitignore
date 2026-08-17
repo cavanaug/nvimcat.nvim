@@ -3,3 +3,6 @@ __pycache__/
 *.py[cod]
 .agent-terminal/
 .bench-page-lines/
+# Accidental GraphicsMagick PostScript dumps (Aug 2026); kept out of history.
+/os
+/runpy
