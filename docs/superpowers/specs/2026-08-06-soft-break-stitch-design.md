@@ -1,7 +1,7 @@
 # Soft-break scroll-stitch — design
 
 **Date:** 2026-08-06  
-**Status:** implemented (core soft-break); amended by [2026-08-07-soft-break-treesitter-addons-design.md](./2026-08-07-soft-break-treesitter-addons-design.md)  
+**Status:** implemented (core soft-break); amended by [2026-08-07-soft-break-treesitter-addons-design.md](./2026-08-07-soft-break-treesitter-addons-design.md) and [2026-08-11-format-handler-boundary-design.md](./2026-08-11-format-handler-boundary-design.md)
 **Goal:** Eliminate wrong/missing lines and run-to-run non-determinism in tall-file scroll-stitch by cutting pages only on blank lines or Neovim-discovered line comments — for **all** filetypes, with **no** markdown-specific structure rules.
 
 ## Problem

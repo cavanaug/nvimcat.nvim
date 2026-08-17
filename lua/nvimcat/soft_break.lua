@@ -51,7 +51,9 @@ function M.line_comment_leaders(buf)
   return M.parse_leaders(vim.bo[buf].commentstring, vim.bo[buf].comments)
 end
 
-local empty_addon = { extra_breaks = {}, suppress_blanks = {} }
+local function empty_addon()
+  return { extra_breaks = {}, suppress_blanks = {} }
+end
 
 ---@param buf integer?
 ---@return { extra_breaks: integer[], suppress_blanks: integer[][] }
@@ -59,18 +61,18 @@ function M.treesitter_addon(buf)
   buf = buf or vim.api.nvim_get_current_buf()
   local ft = vim.bo[buf].filetype or ""
   if ft ~= "markdown" and not ft:match("^markdown") then
-    return empty_addon
+    return empty_addon()
   end
 
   local ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
   if not ok or not parser then
-    return empty_addon
+    return empty_addon()
   end
 
   local trees = parser:parse()
   local root = trees and trees[1] and trees[1]:root()
   if not root then
-    return empty_addon
+    return empty_addon()
   end
 
   local extra, suppress, seen = {}, {}, {}

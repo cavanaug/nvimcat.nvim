@@ -72,6 +72,12 @@ sys.exit(0 if all(checks.values()) else 1)
 PY
 fi
 
+GRANULAR_SCOPES="${NVIMCAT_GRANULAR_SCOPES_FILE:-$HOME/wip_other/src_cavanaug/zoom-cli/.opencode/skills/zoom-skills/oauth/references/granular-scopes.md}"
+if [[ -f "$GRANULAR_SCOPES" ]]; then
+  echo "granular-scopes acid test: $GRANULAR_SCOPES"
+  bash "$ROOT/scripts/check-granular-scopes-tables.sh" "$GRANULAR_SCOPES"
+fi
+
 if command -v agent-terminal >/dev/null 2>&1; then
   echo "compare-tui: $SAMPLE"
   "$ROOT/scripts/compare-tui.sh" "$SAMPLE" "$NVIMCAT_WIDTH"

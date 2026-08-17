@@ -917,7 +917,7 @@ def _soft_break_segments(
     n = len(lines)
     if n == 0:
         return []
-    target = pack_target if pack_target is not None else _STITCH_UI_HEIGHT
+    target = pack_target if pack_target is not None else _stitch_ui_height()
     target = max(24, min(ui_max, int(target)))
     out: list[tuple[int, int]] = []
     start = 1
@@ -952,7 +952,9 @@ def _fetch_soft_break_info(
         "nvim_exec_lua",
         """
 local ok, sb = pcall(require, "nvimcat.soft_break")
-if not ok then return { leaders = {}, addon = { extra_breaks = {}, suppress_blanks = {} } } end
+if not ok then
+  return { leaders = {}, addon = { extra_breaks = {}, suppress_blanks = {} } }
+end
 local leaders = sb.line_comment_leaders()
 local addon = sb.treesitter_addon()
 return { leaders = leaders, addon = addon }
@@ -963,6 +965,19 @@ return { leaders = leaders, addon = addon }
     leaders: list[tuple[str, bool]] = []
     extra: set[int] = set()
     suppress: list[tuple[int, int]] = []
+
+    def _ranges_from(raw_list: object, dest: list[tuple[int, int]]) -> None:
+        if not isinstance(raw_list, list):
+            return
+        for item in raw_list:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                dest.append((int(item[0]), int(item[1])))
+            elif isinstance(item, dict):
+                s = item.get("start", item.get(1))
+                e = item.get("end", item.get(2))
+                if s is not None and e is not None:
+                    dest.append((int(s), int(e)))
+
     if isinstance(raw, dict):
         raw_leaders = raw.get("leaders")
         if isinstance(raw_leaders, list):
@@ -978,16 +993,7 @@ return { leaders = leaders, addon = addon }
                         extra.add(int(x))
                     except (TypeError, ValueError):
                         pass
-            raw_suppress = addon.get("suppress_blanks")
-            if isinstance(raw_suppress, list):
-                for item in raw_suppress:
-                    if isinstance(item, (list, tuple)) and len(item) >= 2:
-                        suppress.append((int(item[0]), int(item[1])))
-                    elif isinstance(item, dict):
-                        s = item.get("start", item.get(1))
-                        e = item.get("end", item.get(2))
-                        if s is not None and e is not None:
-                            suppress.append((int(s), int(e)))
+            _ranges_from(addon.get("suppress_blanks"), suppress)
     return leaders, extra, suppress
 
 
@@ -1082,10 +1088,10 @@ def _trim_page_overlap(
     *,
     max_overlap: int | None = None,
     fallback_trim: int = 0,
-) -> bytes:
-    """Drop leading lines of nxt that duplicate the tail of prev (stale-grid stitch)."""
+) -> tuple[bytes, bytes]:
+    """Return page parts with duplicate stitch overlap removed."""
     if not prev or not nxt:
-        return nxt
+        return prev, nxt
     prev_lines = prev.split(b"\n")
     nxt_lines = nxt.split(b"\n")
     if prev_lines and prev_lines[-1] == b"":
@@ -1099,7 +1105,7 @@ def _trim_page_overlap(
 
     cap = _UI_MAX_LINES if max_overlap is None else max(0, max_overlap)
     if cap == 0:
-        return nxt
+        return prev, nxt
     max_check = min(len(prev_lines), len(nxt_lines), cap)
     matched = False
     for overlap in range(max_check, 0, -1):
@@ -1107,12 +1113,37 @@ def _trim_page_overlap(
             nxt_lines = nxt_lines[overlap:]
             matched = True
             break
+    if not matched:
+        # Render timing can change blank grid-row counts around headings while
+        # leaving the painted content identical. Match the same bounded
+        # suffix/prefix without blank rows, then trim through the corresponding
+        # original row in nxt. Require two content rows to avoid a coincidental
+        # single-line match.
+        prev_keys = [key(x) for x in prev_lines[-cap:] if key(x)]
+        nxt_keyed = [(i, key(x)) for i, x in enumerate(nxt_lines[:cap]) if key(x)]
+        fuzzy_max = min(len(prev_keys), len(nxt_keyed))
+        fuzzy_matches: list[int] = []
+        for overlap in range(fuzzy_max, 1, -1):
+            if prev_keys[-overlap:] == [value for _, value in nxt_keyed[:overlap]]:
+                fuzzy_matches.append(overlap)
+        # Repeated rows can produce multiple valid overlap lengths. That is
+        # ambiguous: use the conservative fallback rather than deleting real
+        # repeated content.
+        if len(fuzzy_matches) == 1:
+            overlap = fuzzy_matches[0]
+            # Blank rows after the last matched content row are viewport paint
+            # artifacts. Leaving them in prev creates a blank table seam.
+            while prev_lines and not key(prev_lines[-1]):
+                prev_lines.pop()
+            prev = b"\n".join(prev_lines) + (b"\n" if prev_lines else b"")
+            nxt_lines = nxt_lines[nxt_keyed[overlap - 1][0] + 1 :]
+            matched = True
     if not matched and fallback_trim > 0:
         nxt_lines = nxt_lines[min(len(nxt_lines), fallback_trim) :]
     if not nxt_lines:
-        return b""
+        return prev, b""
     body = b"\n".join(nxt_lines)
-    return body + (b"\n" if trailing_nl else b"")
+    return prev, body + (b"\n" if trailing_nl else b"")
 
 
 def _wait_grid_change(
@@ -1279,7 +1310,10 @@ vim.wait(5000, function()
     return false
   end
   local now = decorator.n
-  if now > before and now == last then
+  -- ui.update can legitimately be a no-op when the full syntax node is
+  -- already decorated. Waiting for a generation bump in that case burns the
+  -- entire timeout even though the renderer is idle and stable.
+  if now == last then
     stable = stable + 1
     return stable >= 5
   end
@@ -1325,7 +1359,7 @@ vim.wait(3000, function()
     return false
   end
   local now = decorator.n
-  if now > before and now == last then
+  if now == last then
     stable = stable + 1
     return stable >= 3
   end
@@ -1753,7 +1787,7 @@ def capture(width: int, files: list[str]) -> int:
                                 prev_page_h,
                                 prev_page_h - delta + slack,
                             )
-                    part = _trim_page_overlap(
+                    output_parts[-1], part = _trim_page_overlap(
                         output_parts[-1],
                         part,
                         max_overlap=overlap_cap,

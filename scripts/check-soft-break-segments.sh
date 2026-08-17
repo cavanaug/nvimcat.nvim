@@ -14,6 +14,7 @@ exec(compile(code, str(root / "bin" / "nvimcat"), "exec"), ns.__dict__)
 
 seg = ns._soft_break_segments
 is_sb = ns._is_soft_break_line
+trim_overlap = ns._trim_page_overlap
 
 # blanks: pack to last soft break in pack_target window
 lines = ["a", "b", "", "c"]
@@ -79,6 +80,22 @@ lines = ["x"] * 50 + [""] + ["y"] * 50 + [""]
 packed = seg(lines, [], pack_target=40)
 assert packed[0] == (1, 40), packed
 assert packed[1][0] == 41
+
+# Render timing can vary the number of blank grid rows around a heading. The
+# shared nonblank content is still overlap and must not be emitted twice.
+prev = b"intro\nsection\n\nheader\nrow-1\nrow-2\n   \n"
+nxt = b"section\nheader\nrow-1\nrow-2\nrow-3\nbottom\n"
+prev, nxt = trim_overlap(prev, nxt, max_overlap=7, fallback_trim=1)
+assert prev == b"intro\nsection\n\nheader\nrow-1\nrow-2\n", prev
+assert nxt == b"row-3\nbottom\n", nxt
+
+# Repeated content makes a blank-insensitive overlap ambiguous. Prefer the
+# conservative fallback over deleting a possibly legitimate repeated block.
+prev = b"X\nY\nX\n\nY\n"
+nxt = b"X\nY\nX\nY\nZ\n"
+prev_after, nxt_after = trim_overlap(prev, nxt, max_overlap=5, fallback_trim=1)
+assert prev_after == prev, prev_after
+assert nxt_after == b"Y\nX\nY\nZ\n", nxt_after
 
 print("OK soft-break-segments")
 PY
